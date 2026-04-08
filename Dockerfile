@@ -26,6 +26,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY src /app/src
 COPY migrations /app/migrations
 COPY alembic.ini /app/
+COPY entrypoint.sh /app/entrypoint.sh
 
 FROM python:3.12-slim
 
@@ -37,4 +38,6 @@ WORKDIR /app
 COPY --link --from=builder /venv /venv
 COPY --link --from=builder /app /app
 
-CMD ["python", "-m", "src.main"]
+RUN chmod +x /app/entrypoint.sh
+
+CMD ["/app/entrypoint.sh"]

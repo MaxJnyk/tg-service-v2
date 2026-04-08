@@ -1,0 +1,60 @@
+services:
+  tg-service:
+    image: tg-service-v2:fixed
+    container_name: tg-service-v2
+    env_file:
+      - .env
+    depends_on:
+      tg-service-db:
+        condition: service_healthy
+      tg-service-redis:
+        condition: service_healthy
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    networks:
+      - net
+      - tad
+
+  tg-service-db:
+    image: postgres:16-alpine
+    container_name: tg-service-db
+    environment:
+      POSTGRES_DB: tg_service
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - tg_service_pgdata:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - net
+      - tad
+
+  tg-service-redis:
+    image: redis:7-alpine
+    container_name: tg-service-redis
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    networks:
+      - net
+      - tad
+
+volumes:
+  tg_service_pgdata:
+
+networks:
+  net:
+  tad:
+    external: true

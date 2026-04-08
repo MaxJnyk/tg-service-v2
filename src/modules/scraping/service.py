@@ -1,22 +1,38 @@
 """
 Scraping service — scrapes Telegram channels via Telethon.
-Returns data in the format expected by tad-backend's save_parsing_results task.
+
+Returns data in the **exact format** expected by tad-backend's
+``tasks.parsing:save_parsing_results`` → ``ParsingResultPayload``.
+
+Fields: title, description, item_type, external_id, avatar,
+members_count, images_count, videos_count, links_count,
+reactions_count, forwards_count, replies_count,
+average_views_count_daily/weekly/monthly,
+average_messages_daily/weekly/monthly,
+median_views_daily/weekly/monthly,
+men_percent, daily_metrics[].
 """
 
+import asyncio
 import logging
-from datetime import UTC, datetime
+from collections import defaultdict
+from statistics import median
 from typing import Any
 
 from telethon.errors import FloodWaitError, UserBannedInChannelError
 from telethon.tl.functions.channels import GetFullChannelRequest
-from telethon.tl.functions.messages import GetHistoryRequest
+from telethon.tl.types import ChatFull
 
+from src.config import settings
 from src.core import error_codes
 from src.core.exceptions import SessionError
 from src.core.metrics import scraping_operations
 from src.modules.scraping.session_pool import SessionPool
 
 logger = logging.getLogger(__name__)
+
+# Global semaphore: max 10 concurrent scraping operations (prevent mass FloodWait)
+_SCRAPING_SEM = asyncio.Semaphore(10)
 
 
 class ScrapingService:
@@ -27,83 +43,168 @@ class ScrapingService:
         """Scrape channel stats — compatible with tad-backend save_parsing_results."""
         scraping_operations.inc()
 
-        client, session = await self._pool.get_session(role="scrape")
-        try:
-            # Resolve channel
-            entity = await client.get_entity(username)
+        async with _SCRAPING_SEM:  # Limit concurrent scraping (prevent mass FloodWait)
+            client, session = await self._pool.get_session(role="scrape")
+            try:
+                entity = await client.get_entity(username)
 
-            # Full channel info
-            full = await client(GetFullChannelRequest(entity))
-            full_chat = full.full_chat
+                full: ChatFull = await client(GetFullChannelRequest(entity))
+                full_chat = full.full_chat
+                chat = full.chats[0]
 
-            # Recent messages for engagement metrics
-            history = await client(GetHistoryRequest(
-                peer=entity,
-                limit=50,
-                offset_date=None,
-                offset_id=0,
-                max_id=0,
-                min_id=0,
-                add_offset=0,
-                hash=0,
-            ))
+                # --- Common info ---
+                common_data = {
+                    "title": getattr(chat, "title", ""),
+                    "description": getattr(full_chat, "about", "") or "",
+                    "item_type": "CHANNEL" if getattr(chat, "broadcast", False) else "GROUP",
+                    "external_id": chat.id,
+                    "avatar": None,
+                    "members_count": getattr(full_chat, "participants_count", 0) or 0,
+                }
 
-            # Calculate metrics
-            messages = history.messages
-            total_views = sum(getattr(m, "views", 0) or 0 for m in messages)
-            total_forwards = sum(getattr(m, "forwards", 0) or 0 for m in messages)
-            total_reactions = 0
-            for m in messages:
-                if hasattr(m, "reactions") and m.reactions:
-                    total_reactions += sum(r.count for r in m.reactions.results)
+                # --- Stat info (iterate messages) ---
+                stat_data = await self._collect_stat_info(client, chat)
 
-            msg_count = len(messages) or 1
-            avg_views = total_views // msg_count
-            avg_forwards = total_forwards // msg_count
-            avg_reactions = total_reactions // msg_count
+                result = {**common_data, **stat_data}
 
-            # ERR (engagement rate)
-            members_count = getattr(full_chat, "participants_count", 0) or 0
-            err = round((avg_views / members_count * 100), 2) if members_count > 0 else 0.0
+                await self._pool.mark_used(session.id)
+                logger.info(
+                    "Scraped %s: %d members, avg_views_daily=%d, %d daily_metrics",
+                    username,
+                    common_data["members_count"],
+                    stat_data.get("average_views_count_daily", 0),
+                    len(stat_data.get("daily_metrics", [])),
+                )
+                return result
 
-            result = {
-                "platform_id": platform_id,
-                "title": getattr(entity, "title", ""),
-                "username": username,
-                "members_count": members_count,
-                "avg_post_reach": avg_views,
-                "avg_post_forwards": avg_forwards,
-                "avg_post_reactions": avg_reactions,
-                "err": err,
-                "daily_metrics": [],  # Can be extended later
-                "scraped_at": datetime.now(UTC).isoformat(),
-            }
+            except FloodWaitError as exc:
+                logger.warning("FloodWait %ds on session %s", exc.seconds, session.phone)
+                await self._pool.mark_flood_wait(session.id, exc.seconds)
+                raise SessionError(
+                    f"FloodWait {exc.seconds}s",
+                    error_code=error_codes.SESSION_FLOOD_WAIT,
+                ) from exc
 
-            await self._pool.mark_used(session.id)
-            logger.info(
-                "Scraped %s: %d members, avg_views=%d, ERR=%.2f%%",
-                username, members_count, avg_views, err,
-            )
-            return result
+            except UserBannedInChannelError as exc:
+                await self._pool.mark_session_failed(session.id)
+                raise SessionError(
+                    str(exc),
+                    error_code=error_codes.SESSION_BANNED,
+                ) from exc
 
-        except FloodWaitError as exc:
-            logger.warning("FloodWait %ds on session %s", exc.seconds, session.phone)
-            await self._pool.mark_flood_wait(session.id, exc.seconds)
-            raise SessionError(
-                f"FloodWait {exc.seconds}s",
-                error_code=error_codes.SESSION_FLOOD_WAIT,
-            ) from exc
+            except Exception as exc:
+                await self._pool.mark_session_failed(session.id)
+                raise SessionError(
+                    str(exc),
+                    error_code=error_codes.SESSION_NOT_AVAILABLE,
+                ) from exc
 
-        except UserBannedInChannelError as exc:
-            await self._pool.mark_session_failed(session.id)
-            raise SessionError(
-                str(exc),
-                error_code=error_codes.SESSION_BANNED,
-            ) from exc
+    @staticmethod
+    async def _collect_stat_info(client: Any, chat: Any) -> dict[str, Any]:
+        """Iterate channel messages and compute stats matching ParsingResultPayload."""
+        images_count = 0
+        videos_count = 0
+        links_count = 0
+        reactions_count = 0
+        forwards_count = 0
+        replies_count = 0
 
-        except Exception as exc:
-            await self._pool.mark_session_failed(session.id)
-            raise SessionError(
-                str(exc),
-                error_code=error_codes.SESSION_NOT_AVAILABLE,
-            ) from exc
+        daily_views: dict[str, dict] = defaultdict(
+            lambda: {"total_views": 0, "count": 0, "reactions": 0, "comments": 0, "forwards": 0}
+        )
+        weekly_views: dict[str, dict] = defaultdict(lambda: {"total_views": 0, "count": 0})
+        monthly_views: dict[str, dict] = defaultdict(lambda: {"total_views": 0, "count": 0})
+
+        messages_count = 0
+        async for msg in client.iter_messages(chat, limit=settings.MAX_MSG_ANALYZE):
+            if not msg.date:
+                continue
+            messages_count += 1
+            d = msg.date.date()
+            range_day = f"{d.year}-{d.month:02d}-{d.day:02d}"
+            range_week = f"{d.year}-{d.isocalendar()[1]:02d}"
+            range_month = f"{d.year}-{d.month:02d}"
+
+            daily_views[range_day]["count"] += 1
+            if msg.views:
+                daily_views[range_day]["total_views"] += msg.views
+                weekly_views[range_week]["total_views"] += msg.views
+                weekly_views[range_week]["count"] += 1
+                monthly_views[range_month]["total_views"] += msg.views
+                monthly_views[range_month]["count"] += 1
+
+            msg_replies = (msg.to_dict().get("replies") or {}).get("replies") or 0
+            replies_count += msg_replies
+            msg_forwards = msg.forwards or 0
+            forwards_count += msg_forwards
+            daily_views[range_day]["comments"] += msg_replies
+            daily_views[range_day]["forwards"] += msg_forwards
+
+            if media := msg.media:
+                media_dict = media.to_dict()
+                if media_dict.get("_") == "MessageMediaPhoto":
+                    images_count += 1
+                elif (
+                    media_dict.get("_") == "MessageMediaDocument"
+                    and media_dict.get("document", {}).get("mime_type", "").startswith("video")
+                ):
+                    videos_count += 1
+
+            if entities := msg.entities:
+                links_count += sum(1 for e in entities if "url" in e.to_dict())
+
+            if msg.reactions:
+                msg_reactions = sum(r.count for r in msg.reactions.results)
+                reactions_count += msg_reactions
+                daily_views[range_day]["reactions"] += msg_reactions
+
+        # --- Averages ---
+        avg_daily_views = (
+            sum(d["total_views"] for d in daily_views.values()) // len(daily_views) if daily_views else 0
+        )
+        avg_weekly_views = (
+            sum(w["total_views"] for w in weekly_views.values()) // len(weekly_views) if weekly_views else 0
+        )
+        avg_monthly_views = (
+            sum(m["total_views"] for m in monthly_views.values()) // len(monthly_views) if monthly_views else 0
+        )
+
+        # --- Medians ---
+        median_daily = int(median(d["total_views"] for d in daily_views.values())) if daily_views else 0
+        median_weekly = int(median(w["total_views"] for w in weekly_views.values())) if weekly_views else 0
+        median_monthly = int(median(m["total_views"] for m in monthly_views.values())) if monthly_views else 0
+
+        # --- Average messages ---
+        avg_messages_daily = messages_count // len(daily_views) if daily_views else 0
+        avg_messages_weekly = messages_count // len(weekly_views) if weekly_views else 0
+        avg_messages_monthly = messages_count // len(monthly_views) if monthly_views else 0
+
+        return {
+            "average_views_count_daily": avg_daily_views,
+            "average_views_count_weekly": avg_weekly_views,
+            "average_views_count_monthly": avg_monthly_views,
+            "average_messages_daily": avg_messages_daily,
+            "average_messages_weekly": avg_messages_weekly,
+            "average_messages_monthly": avg_messages_monthly,
+            "median_views_daily": median_daily,
+            "median_views_weekly": median_weekly,
+            "median_views_monthly": median_monthly,
+            "images_count": images_count,
+            "videos_count": videos_count,
+            "links_count": links_count,
+            "reactions_count": reactions_count,
+            "forwards_count": forwards_count,
+            "replies_count": replies_count,
+            "men_percent": 0,
+            "daily_metrics": [
+                {
+                    "date": day_key,
+                    "views_count": day_data["total_views"],
+                    "comments_count": day_data["comments"],
+                    "reactions_count": day_data["reactions"],
+                    "reposts_count": day_data["forwards"],
+                    "posts_count": day_data["count"],
+                }
+                for day_key, day_data in sorted(daily_views.items())
+            ],
+        }

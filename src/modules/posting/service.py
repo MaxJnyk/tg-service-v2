@@ -2,6 +2,7 @@
 Posting service — send/edit/delete messages via aiogram bots.
 """
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 from typing import Any
@@ -12,55 +13,124 @@ from aiogram.exceptions import (
     TelegramNotFound,
     TelegramRetryAfter,
 )
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy import update
 
 from src.core import error_codes
 from src.core.exceptions import BotError
 from src.core.metrics import posting_operations
 from src.infrastructure.database import async_session_factory
+from src.infrastructure.rate_limiter import RateLimiter
 from src.modules.accounts.models import BotAccount
 from src.modules.posting.bot_pool import BotPool
+from src.modules.posting.retry import BACKOFF_SECONDS, MAX_RETRIES
 
 logger = logging.getLogger(__name__)
 
 
 class PostingService:
-    def __init__(self, bot_pool: BotPool) -> None:
+    def __init__(self, bot_pool: BotPool, rate_limiter: RateLimiter | None = None) -> None:
         self._bot_pool = bot_pool
+        self._rate_limiter = rate_limiter
+
+    @staticmethod
+    def resolve_chat_id(raw: str) -> str | int:
+        """Convert platform URL or raw value to a chat_id aiogram understands.
+
+        Examples:
+            "https://t.me/channel_name" → "@channel_name"
+            "@channel_name"             → "@channel_name"
+            "-1001234567890"            → -1001234567890
+        """
+        if isinstance(raw, str):
+            raw = raw.strip()
+            # https://t.me/channel or http://t.me/channel
+            if "t.me/" in raw:
+                username = raw.rstrip("/").split("/")[-1]
+                return f"@{username}"
+            # Already numeric
+            if raw.lstrip("-").isdigit():
+                return int(raw)
+        return raw
+
+    @staticmethod
+    def _build_reply_markup(markup_data: list[dict] | None) -> InlineKeyboardMarkup | None:
+        """Build InlineKeyboardMarkup from backend payload."""
+        if not markup_data:
+            return None
+        buttons = []
+        for btn in markup_data:
+            url = btn.get("url")
+            text = btn.get("text", "Link")
+            if url:
+                buttons.append([InlineKeyboardButton(text=text, url=url)])
+        return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
 
     async def send_message(
         self,
         chat_id: str | int,
         text: str,
         platform_id: str | None = None,
+        media: str | None = None,
+        markup: list[dict] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
-        """Send a new message to a Telegram chat."""
+        """Send a new message (text or photo) to a Telegram chat."""
         posting_operations.labels(operation="send").inc()
+        reply_markup = self._build_reply_markup(markup)
 
-        bot, account = await self._bot_pool.get_bot_for_platform(platform_id or "")
-        try:
-            msg = await bot.send_message(chat_id=chat_id, text=text, **kwargs)
-            await self._mark_used(account.id)
-            logger.info("Sent message to %s via bot %s, message_id=%d", chat_id, account.name, msg.message_id)
-            return {"message_id": msg.message_id, "chat_id": str(chat_id)}
+        if self._rate_limiter:
+            await self._rate_limiter.acquire(str(chat_id))
 
-        except TelegramRetryAfter as exc:
-            logger.warning("Rate limited bot %s, retry after %ds", account.name, exc.retry_after)
-            raise BotError(
-                f"Rate limited, retry after {exc.retry_after}s",
-                error_code=error_codes.BOT_RATE_LIMITED,
-            ) from exc
+        last_exc: Exception | None = None
+        for attempt in range(MAX_RETRIES):
+            bot, account = await self._bot_pool.get_bot_for_platform(platform_id or "")
+            try:
+                if media:
+                    msg = await bot.send_photo(
+                        chat_id=chat_id,
+                        photo=media,
+                        caption=text or None,
+                        reply_markup=reply_markup,
+                        **kwargs,
+                    )
+                else:
+                    msg = await bot.send_message(
+                        chat_id=chat_id,
+                        text=text,
+                        reply_markup=reply_markup,
+                        **kwargs,
+                    )
+                await self._mark_used(account.id)
+                logger.info("Sent message to %s via bot %s, message_id=%d", chat_id, account.name, msg.message_id)
+                return {"message_id": msg.message_id, "chat_id": str(chat_id)}
 
-        except TelegramForbiddenError as exc:
-            await self._bot_pool.mark_bot_failed(account.id)
-            raise BotError(str(exc), error_code=error_codes.BOT_BLOCKED) from exc
+            except TelegramRetryAfter as exc:
+                logger.warning("Rate limited bot %s, retry after %ds", account.name, exc.retry_after)
+                raise BotError(
+                    f"Rate limited, retry after {exc.retry_after}s",
+                    error_code=error_codes.BOT_RATE_LIMITED,
+                ) from exc
 
-        except TelegramNotFound as exc:
-            raise BotError(str(exc), error_code=error_codes.BOT_CHAT_NOT_FOUND) from exc
+            except TelegramForbiddenError as exc:
+                last_exc = exc
+                await self._bot_pool.mark_bot_failed(account.id)
+                logger.warning("Bot %s forbidden (attempt %d/%d), retrying with next bot", account.name, attempt + 1, MAX_RETRIES)
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(BACKOFF_SECONDS[attempt])
 
-        except TelegramBadRequest as exc:
-            raise BotError(str(exc), error_code=error_codes.BOT_NOT_ADMIN) from exc
+            except (TelegramNotFound, TelegramBadRequest) as exc:
+                msg = str(exc).lower()
+                if "chat not found" in msg or "peer_id_invalid" in msg:
+                    raise BotError(str(exc), error_code=error_codes.BOT_CHAT_NOT_FOUND) from exc
+                if "not enough rights" in msg or "need administrator" in msg:
+                    raise BotError(str(exc), error_code=error_codes.BOT_NOT_ADMIN) from exc
+                raise BotError(str(exc), error_code=error_codes.INVALID_PAYLOAD) from exc
+
+        raise BotError(
+            f"All {MAX_RETRIES} retries failed: {last_exc}",
+            error_code=error_codes.ALL_BOTS_FAILED,
+        )
 
     async def edit_message(
         self,
@@ -68,26 +138,67 @@ class PostingService:
         message_id: int,
         text: str,
         platform_id: str | None = None,
+        media: str | None = None,
+        markup: list[dict] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Edit an existing message."""
         posting_operations.labels(operation="edit").inc()
+        reply_markup = self._build_reply_markup(markup)
 
-        bot, account = await self._bot_pool.get_bot_for_platform(platform_id or "")
-        try:
-            await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, **kwargs)
-            await self._mark_used(account.id)
-            logger.info("Edited message %d in %s via bot %s", message_id, chat_id, account.name)
-            return {"message_id": message_id, "chat_id": str(chat_id)}
+        if self._rate_limiter:
+            await self._rate_limiter.acquire(str(chat_id))
 
-        except TelegramRetryAfter as exc:
-            raise BotError(
-                f"Rate limited, retry after {exc.retry_after}s",
-                error_code=error_codes.BOT_RATE_LIMITED,
-            ) from exc
+        last_exc: Exception | None = None
+        for attempt in range(MAX_RETRIES):
+            bot, account = await self._bot_pool.get_bot_for_platform(platform_id or "")
+            try:
+                if media:
+                    from aiogram.types import InputMediaPhoto
+                    await bot.edit_message_media(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        media=InputMediaPhoto(media=media, caption=text or None),
+                        reply_markup=reply_markup,
+                        **kwargs,
+                    )
+                else:
+                    await bot.edit_message_text(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text=text,
+                        reply_markup=reply_markup,
+                        **kwargs,
+                    )
+                await self._mark_used(account.id)
+                logger.info("Edited message %d in %s via bot %s", message_id, chat_id, account.name)
+                return {"message_id": message_id, "chat_id": str(chat_id)}
 
-        except (TelegramForbiddenError, TelegramBadRequest, TelegramNotFound) as exc:
-            raise BotError(str(exc), error_code=error_codes.BOT_BLOCKED) from exc
+            except TelegramRetryAfter as exc:
+                raise BotError(
+                    f"Rate limited, retry after {exc.retry_after}s",
+                    error_code=error_codes.BOT_RATE_LIMITED,
+                ) from exc
+
+            except TelegramForbiddenError as exc:
+                last_exc = exc
+                await self._bot_pool.mark_bot_failed(account.id)
+                logger.warning("Bot %s forbidden on edit (attempt %d/%d)", account.name, attempt + 1, MAX_RETRIES)
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(BACKOFF_SECONDS[attempt])
+
+            except (TelegramBadRequest, TelegramNotFound) as exc:
+                msg = str(exc).lower()
+                if "chat not found" in msg or "peer_id_invalid" in msg:
+                    raise BotError(str(exc), error_code=error_codes.BOT_CHAT_NOT_FOUND) from exc
+                if "not enough rights" in msg or "need administrator" in msg:
+                    raise BotError(str(exc), error_code=error_codes.BOT_NOT_ADMIN) from exc
+                raise BotError(str(exc), error_code=error_codes.INVALID_PAYLOAD) from exc
+
+        raise BotError(
+            f"All {MAX_RETRIES} retries failed: {last_exc}",
+            error_code=error_codes.ALL_BOTS_FAILED,
+        )
 
     async def delete_message(
         self,
@@ -98,15 +209,37 @@ class PostingService:
         """Delete a message."""
         posting_operations.labels(operation="delete").inc()
 
-        bot, account = await self._bot_pool.get_bot_for_platform(platform_id or "")
-        try:
-            await bot.delete_message(chat_id=chat_id, message_id=message_id)
-            await self._mark_used(account.id)
-            logger.info("Deleted message %d in %s via bot %s", message_id, chat_id, account.name)
-            return {"message_id": message_id, "chat_id": str(chat_id), "deleted": True}
+        if self._rate_limiter:
+            await self._rate_limiter.acquire(str(chat_id))
 
-        except (TelegramForbiddenError, TelegramBadRequest, TelegramNotFound) as exc:
-            raise BotError(str(exc), error_code=error_codes.BOT_BLOCKED) from exc
+        last_exc: Exception | None = None
+        for attempt in range(MAX_RETRIES):
+            bot, account = await self._bot_pool.get_bot_for_platform(platform_id or "")
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message_id)
+                await self._mark_used(account.id)
+                logger.info("Deleted message %d in %s via bot %s", message_id, chat_id, account.name)
+                return {"message_id": message_id, "chat_id": str(chat_id), "deleted": True}
+
+            except TelegramForbiddenError as exc:
+                last_exc = exc
+                await self._bot_pool.mark_bot_failed(account.id)
+                logger.warning("Bot %s forbidden on delete (attempt %d/%d)", account.name, attempt + 1, MAX_RETRIES)
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(BACKOFF_SECONDS[attempt])
+
+            except (TelegramBadRequest, TelegramNotFound) as exc:
+                msg = str(exc).lower()
+                if "chat not found" in msg or "peer_id_invalid" in msg:
+                    raise BotError(str(exc), error_code=error_codes.BOT_CHAT_NOT_FOUND) from exc
+                if "not enough rights" in msg or "need administrator" in msg:
+                    raise BotError(str(exc), error_code=error_codes.BOT_NOT_ADMIN) from exc
+                raise BotError(str(exc), error_code=error_codes.INVALID_PAYLOAD) from exc
+
+        raise BotError(
+            f"All {MAX_RETRIES} retries failed: {last_exc}",
+            error_code=error_codes.ALL_BOTS_FAILED,
+        )
 
     @staticmethod
     async def _mark_used(bot_account_id: str) -> None:

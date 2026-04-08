@@ -11,6 +11,13 @@ from src.core.exceptions import BotError
 
 
 @pytest.fixture
+def mock_redis():
+    redis = AsyncMock()
+    redis.set = AsyncMock(return_value=True)  # NX succeeded = not duplicate
+    return redis
+
+
+@pytest.fixture
 def mock_posting_service():
     service = AsyncMock(spec=PostingService)
     service.send_message = AsyncMock(return_value={"message_id": 42, "chat_id": "-100123"})
@@ -20,8 +27,9 @@ def mock_posting_service():
 
 
 @pytest.fixture
-def handlers(mock_posting_service):
-    return create_posting_handlers(mock_posting_service)
+def handlers(mock_posting_service, mock_redis):
+    with patch("src.modules.posting.handlers.get_redis", return_value=mock_redis):
+        yield create_posting_handlers(mock_posting_service)
 
 
 class TestSendBotMessageHandler:

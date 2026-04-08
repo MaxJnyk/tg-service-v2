@@ -37,7 +37,7 @@ class TestPlatformSchema:
             id="550e8400-e29b-41d4-a716-446655440000",
             url="https://t.me/channel",
         )
-        assert p.id == "550e8400-e29b-41d4-a716-446655440000"
+        assert str(p.id) == "550e8400-e29b-41d4-a716-446655440000"
 
     def test_empty(self):
         p = PlatformSchema()

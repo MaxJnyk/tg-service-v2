@@ -30,7 +30,10 @@ class Settings(BaseSettings):
 
     # Telegram pools
     BOT_POOL_MAX_SIZE: int = 50
-    SESSION_POOL_MAX_SIZE: int = 20
+    SESSION_POOL_MAX_SIZE: int = 100  # 100 sessions for 1000 platforms (10 per account)
+
+    # Scraping
+    MAX_MSG_ANALYZE: int = 200
 
     # Monitoring
     LOG_LEVEL: str = "INFO"

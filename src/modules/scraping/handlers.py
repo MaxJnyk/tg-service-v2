@@ -7,7 +7,7 @@ Parses PlatformSchema from payload, calls ScrapingService, sends result.
 
 import logging
 
-from src.core.exceptions import TelegramServiceError
+from src.core.exceptions import NoAvailableSessionError, TelegramServiceError
 from src.modules.scraping.service import ScrapingService
 from src.transport.producer import KafkaResultProducer
 from src.transport.schemas import TaskRequestSchema
@@ -49,12 +49,19 @@ def create_scraping_handlers(scraping_service: ScrapingService) -> dict:
                 request=request,
                 payload=result,
             )
+        except NoAvailableSessionError as exc:
+            logger.error("scrape_platform: no active session available")
+            await producer.send_result(
+                original_topic="scrape_platform",
+                request=request,
+                error=f"[{exc.error_code}] {exc}",
+            )
         except TelegramServiceError as exc:
             logger.error("scrape_platform failed: %s (code=%s)", exc, exc.error_code)
             await producer.send_result(
                 original_topic="scrape_platform",
                 request=request,
-                error=f"{exc.error_code}: {exc}",
+                error=f"[{exc.error_code}] {exc}",
             )
 
     return {

@@ -24,7 +24,8 @@ from src.config import settings
 from src.core.logging import setup_logging
 from src.core.metrics import service_up
 from src.infrastructure.database import close_engine
-from src.infrastructure.redis import close_redis
+from src.infrastructure.rate_limiter import RateLimiter
+from src.infrastructure.redis import close_redis, get_redis
 from src.modules.posting.bot_pool import BotPool
 from src.modules.posting.handlers import create_posting_handlers
 from src.modules.posting.service import PostingService
@@ -47,7 +48,8 @@ session_pool = SessionPool(max_size=settings.SESSION_POOL_MAX_SIZE)
 def _register_handlers(router: TopicRouter) -> None:
     """Register topic handlers. Add new handlers here as modules are built."""
     # Posting handlers (Day 4)
-    posting_service = PostingService(bot_pool)
+    rate_limiter = RateLimiter(get_redis())
+    posting_service = PostingService(bot_pool, rate_limiter=rate_limiter)
     posting_handlers = create_posting_handlers(posting_service)
     for topic, handler in posting_handlers.items():
         router.register(topic, handler)

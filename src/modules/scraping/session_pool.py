@@ -2,7 +2,9 @@
 Session pool — manages Telethon client lifecycle with round-robin selection.
 """
 
+import asyncio
 import logging
+import random
 from datetime import UTC, datetime
 
 from sqlalchemy import select, update
@@ -15,12 +17,17 @@ from src.modules.scraping.telethon_client import create_telethon_client
 
 logger = logging.getLogger(__name__)
 
+# Anti-detect: random delay before each Telegram request
+_JITTER_MIN = 0.5
+_JITTER_MAX = 2.5
+
 
 class SessionPool:
     def __init__(self, max_size: int = 20) -> None:
         self._pool: dict[str, TelegramClient] = {}  # session_id -> client
         self._max_size = max_size
         self._round_robin_index = 0
+        self._lock = asyncio.Lock()  # Guards pool dict mutations
 
     async def get_session(self, role: str = "scrape") -> tuple[TelegramClient, TelegramSession]:
         """Get an active session for the given role. Creates client if not in pool."""
@@ -53,16 +60,31 @@ class SessionPool:
                 )
                 proxy = proxy_result.scalar_one_or_none()
 
-        # Get or create client
-        if session.id not in self._pool:
-            client = create_telethon_client(session, proxy)
-            await client.connect()
-            if not await client.is_user_authorized():
-                logger.error("Session %s not authorized, marking as archived", session.phone)
-                await self._mark_session_status(session.id, "archived")
-                raise NoAvailableSessionError(f"Session {session.phone} not authorized")
-            self._pool[session.id] = client
-            logger.info("Connected session %s (pool size: %d)", session.phone, len(self._pool))
+        # Get or create client; reconnect if connection dropped
+        async with self._lock:
+            existing = self._pool.get(session.id)
+            if existing is not None and not existing.is_connected():
+                logger.warning("Session %s lost connection, reconnecting", session.phone)
+                try:
+                    await existing.disconnect()
+                except Exception:
+                    pass
+                del self._pool[session.id]
+                existing = None
+
+            if existing is None:
+                client = create_telethon_client(session, proxy)
+                await client.connect()
+                if not await client.is_user_authorized():
+                    logger.error("Session %s not authorized, marking as archived", session.phone)
+                    await self._mark_session_status(session.id, "archived")
+                    raise NoAvailableSessionError(f"Session {session.phone} not authorized")
+                self._pool[session.id] = client
+                logger.info("Connected session %s (pool size: %d)", session.phone, len(self._pool))
+
+        # Anti-detect jitter after connection (before actual Telegram API call)
+        jitter = random.uniform(_JITTER_MIN, _JITTER_MAX)
+        await asyncio.sleep(jitter)
 
         return self._pool[session.id], session
 
@@ -73,8 +95,9 @@ class SessionPool:
         until += timedelta(seconds=wait_seconds)
         await self._mark_session_flood(session_id, until)
 
-        if session_id in self._pool:
-            del self._pool[session_id]
+        async with self._lock:
+            if session_id in self._pool:
+                del self._pool[session_id]
 
     async def mark_session_failed(self, session_id: str) -> None:
         """Increment fail count; deactivate after 5 failures."""
@@ -88,8 +111,9 @@ class SessionPool:
                 if session.fail_count >= 5:
                     session.status = "banned"
                     logger.warning("Session %s marked as banned after %d failures", session.phone, session.fail_count)
-                    if session_id in self._pool:
-                        del self._pool[session_id]
+                    async with self._lock:
+                        if session_id in self._pool:
+                            del self._pool[session_id]
                 await db.commit()
 
     async def mark_used(self, session_id: str) -> None:
