@@ -1,0 +1,57 @@
+[project]
+name = "tg-service-v2"
+version = "0.1.0"
+description = "TAD Telegram Service v2 — Kafka-compatible replacement for tg-messenger-service"
+requires-python = ">=3.12"
+dependencies = [
+    # Kafka
+    "aiokafka>=0.10.0",
+    # Database
+    "asyncpg>=0.29.0",
+    "sqlalchemy[asyncio]>=2.0.30",
+    "alembic>=1.13.0",
+    # Redis
+    "redis[hiredis]>=5.0.0",
+    # Telegram
+    "aiogram>=3.7.0",
+    "telethon>=1.36.0",
+    "python-socks[asyncio]>=2.4.0",
+    # Config & Validation
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.3.0",
+    # Security
+    "cryptography>=42.0.0",
+    # Logging & Monitoring
+    "structlog>=24.1.0",
+    "prometheus-client>=0.20.0",
+    # CLI
+    "typer[all]>=0.12.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=5.0.0",
+    "ruff>=0.4.0",
+    "mypy>=1.10.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true

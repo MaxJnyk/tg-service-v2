@@ -1,0 +1,41 @@
+services:
+  tg-service:
+    build: .
+    container_name: tg-service-v2
+    env_file: .env
+    depends_on:
+      tg-service-db:
+        condition: service_healthy
+      tg-service-redis:
+        condition: service_healthy
+    restart: unless-stopped
+    ports:
+      - "9090:9090"  # Prometheus metrics only
+
+  tg-service-db:
+    image: postgres:16-alpine
+    container_name: tg-service-db
+    environment:
+      POSTGRES_DB: tg_service
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - tg_service_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  tg-service-redis:
+    image: redis:7-alpine
+    container_name: tg-service-redis
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  tg_service_pgdata:
