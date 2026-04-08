@@ -2,6 +2,10 @@
 
 ## ФАКТ: что реально нужно
 
+**Подтверждено от SEO (Александр, X-Pay)**:
+> Только TG BOT для постинга, НЕ userbots. Других сценариев не рассматриваем.
+> Userbots нужны ТОЛЬКО для скрапинга (сбор статистики), т.к. Bot API не даёт такой функционал.
+
 Изучив tad-backend, вот что я нашёл:
 
 **tad-backend TaskTypes** (то что бекенд РЕАЛЬНО отправляет в Kafka):
@@ -128,22 +132,10 @@ async for msg in self._consumer:
 
 ---
 
-### БЛОК 4 — Userbot posting (P2, КОГДА бекенд добавит TaskTypes)
+### БЛОК 4 — ~~Userbot posting~~ ОТМЕНЕНО
 
-Сейчас бекенд шлёт `send_bot_message` — это BOT posting через aiogram.
-Userbot posting (`new_message` через telethon) бекенд **не вызывает**.
-
-**Когда добавлять**: Когда бекенд добавит `TaskTypes.NEW_USERBOT_MESSAGE = "new_message"`.
-
-**Что нужно**:
-- `src/modules/posting/userbot_service.py` — аналог PostingService но на telethon
-- `telethon.client.send_message()` / `edit_message()` / `delete_messages()`
-- Использует SessionPool (уже есть) вместо BotPool
-- Rate limiting через тот же RateLimiter (уже есть)
-
-**Либы**: telethon (уже есть), ничего нового.
-
-**Effort**: 4-5 часов
+> Подтверждено SEO: постинг ТОЛЬКО через TG Bot. Userbot posting НЕ нужен.
+> Userbots = только скрапинг. Это уже реализовано через SessionPool + ScrapingService.
 
 ---
 
@@ -185,11 +177,24 @@ client.send_message(entity, message, reply_to=msg_id)
 | 5 | forward_message handler (2.2) | 1ч | Бекенд: добавить TaskType |
 | 6 | subscribe/unsubscribe (2.3) | 2ч | Бекенд: добавить TaskType |
 | 7 | Periodic re-scrape (1) | 3-4ч | Ничего |
-| 8 | Userbot posting (4) | 4-5ч | Бекенд: добавить TaskType |
+| 8 | ~~Userbot posting~~ | — | ОТМЕНЕНО (SEO: только TG Bot) |
 | 9 | Account management (5) | 8ч | Бекенд: добавить TaskTypes |
 
 **Шаги 1-3 и 7 делаем СЕЙЧАС** — не зависят от бекенда.
 **Шаги 4-6, 8-9** — после расширения TaskTypes в бекенде.
 
 **Итого без бекенд-зависимостей: ~7 часов.**
-**Итого с бекендом: ~23 часа.**
+**Итого с бекендом: ~18 часов.** (было 23, убрали userbot posting)
+
+---
+
+## АРХИТЕКТУРА (итог)
+
+```
+ПОСТИНГ:  tad-backend → Kafka → tg-service-v2 → aiogram Bot API → Telegram
+СКРАПИНГ: tad-backend → Kafka → tg-service-v2 → telethon Userbot → Telegram
+```
+
+- **aiogram** (Bot API) = постинг, пины, форварды, проверки админки
+- **telethon** (Userbot) = ТОЛЬКО скрапинг статистики + подписка на каналы
+- Новых либ НЕ нужно. Всё есть в pyproject.toml.
