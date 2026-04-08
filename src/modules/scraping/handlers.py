@@ -8,11 +8,21 @@ Parses PlatformSchema from payload, calls ScrapingService, sends result.
 import logging
 
 from src.core.exceptions import NoAvailableSessionError, TelegramServiceError
+from src.infrastructure.redis import get_redis
 from src.modules.scraping.service import ScrapingService
 from src.transport.producer import KafkaResultProducer
 from src.transport.schemas import TaskRequestSchema
 
 logger = logging.getLogger(__name__)
+
+_IDEMPOTENCY_TTL = 86400  # 24h
+
+
+async def _check_idempotency(request_id: str) -> bool:
+    """Return True if already processed (duplicate)."""
+    key = f"tg_idem:scrape:{request_id}"
+    result = await get_redis().set(key, "1", nx=True, ex=_IDEMPOTENCY_TTL)
+    return result is None  # None → key existed → duplicate
 
 
 def create_scraping_handlers(scraping_service: ScrapingService) -> dict:
@@ -22,6 +32,10 @@ def create_scraping_handlers(scraping_service: ScrapingService) -> dict:
         request: TaskRequestSchema,
         producer: KafkaResultProducer,
     ) -> None:
+        if await _check_idempotency(str(request.request_id)):
+            logger.warning("scrape_platform: duplicate request_id=%s, skipping", request.request_id)
+            return
+
         payload = request.payload or {}
 
         # Extract platform info — compatible with ScrapperTaskSchema

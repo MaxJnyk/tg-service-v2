@@ -3,7 +3,7 @@ Tests for scraping Kafka handler.
 """
 
 import pytest
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from src.modules.scraping.handlers import create_scraping_handlers
 from src.modules.scraping.service import ScrapingService
@@ -33,6 +33,13 @@ def handlers(mock_scraping_service):
     return create_scraping_handlers(mock_scraping_service)
 
 
+@pytest.fixture(autouse=True)
+def mock_idempotency():
+    """Patch idempotency so tests don't need a real Redis."""
+    with patch("src.modules.scraping.handlers._check_idempotency", return_value=False):
+        yield
+
+
 class TestScrapePlatformHandler:
     @pytest.mark.asyncio
     async def test_success(self, handlers, mock_producer, sample_scrape_request, mock_scraping_service):
@@ -58,6 +65,15 @@ class TestScrapePlatformHandler:
 
         call_kwargs = mock_producer.send_result.call_args.kwargs
         assert "SESSION_FLOOD_WAIT" in call_kwargs["error"]
+
+    @pytest.mark.asyncio
+    async def test_duplicate_request_skipped(self, handlers, mock_producer, sample_scrape_request, mock_scraping_service):
+        with patch("src.modules.scraping.handlers._check_idempotency", return_value=True):
+            handler = handlers["scrape_platform"]
+            await handler(sample_scrape_request, mock_producer)
+
+        mock_scraping_service.scrape_platform.assert_not_called()
+        mock_producer.send_result.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_missing_url(self, handlers, mock_producer):

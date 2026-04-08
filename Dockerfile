@@ -14,7 +14,7 @@ ENV PATH="/venv/bin:$PATH" \
     UV_PYTHON_DOWNLOADS=never \
     VIRTUAL_ENV=/venv
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+RUN pip install uv --quiet
 
 WORKDIR /app
 RUN --mount=type=cache,target=/root/.cache/uv \

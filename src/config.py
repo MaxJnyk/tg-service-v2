@@ -27,6 +27,7 @@ class Settings(BaseSettings):
 
     # Security
     ENCRYPTION_KEY: str = "CHANGE_ME_32_BYTES_BASE64_KEY_HERE"
+    ENCRYPTION_KEY_OLD: str = ""  # Previous key for rotation; leave empty if no rotation
 
     # Telegram pools
     BOT_POOL_MAX_SIZE: int = 50

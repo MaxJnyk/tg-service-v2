@@ -106,11 +106,13 @@ class PostingService:
                 return {"message_id": msg.message_id, "chat_id": str(chat_id)}
 
             except TelegramRetryAfter as exc:
-                logger.warning("Rate limited bot %s, retry after %ds", account.name, exc.retry_after)
-                raise BotError(
-                    f"Rate limited, retry after {exc.retry_after}s",
-                    error_code=error_codes.BOT_RATE_LIMITED,
-                ) from exc
+                last_exc = exc
+                logger.warning(
+                    "Rate limited bot %s, retry after %ds (attempt %d/%d)",
+                    account.name, exc.retry_after, attempt + 1, MAX_RETRIES,
+                )
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(exc.retry_after)
 
             except TelegramForbiddenError as exc:
                 last_exc = exc
@@ -173,10 +175,13 @@ class PostingService:
                 return {"message_id": message_id, "chat_id": str(chat_id)}
 
             except TelegramRetryAfter as exc:
-                raise BotError(
-                    f"Rate limited, retry after {exc.retry_after}s",
-                    error_code=error_codes.BOT_RATE_LIMITED,
-                ) from exc
+                last_exc = exc
+                logger.warning(
+                    "Rate limited bot %s on edit, retry after %ds (attempt %d/%d)",
+                    account.name, exc.retry_after, attempt + 1, MAX_RETRIES,
+                )
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(exc.retry_after)
 
             except TelegramForbiddenError as exc:
                 last_exc = exc
@@ -219,6 +224,15 @@ class PostingService:
                 logger.info("Deleted message %d in %s via bot %s", message_id, chat_id, account.name)
                 return {"message_id": message_id, "chat_id": str(chat_id), "deleted": True}
 
+            except TelegramRetryAfter as exc:
+                last_exc = exc
+                logger.warning(
+                    "Rate limited bot %s on delete, retry after %ds (attempt %d/%d)",
+                    account.name, exc.retry_after, attempt + 1, MAX_RETRIES,
+                )
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(exc.retry_after)
+
             except TelegramForbiddenError as exc:
                 last_exc = exc
                 await self._bot_pool.mark_bot_failed(account.id)
@@ -239,12 +253,34 @@ class PostingService:
             error_code=error_codes.ALL_BOTS_FAILED,
         )
 
-    @staticmethod
-    async def _mark_used(bot_account_id: str) -> None:
-        async with async_session_factory() as session:
-            await session.execute(
-                update(BotAccount)
-                .where(BotAccount.id == bot_account_id)
-                .values(last_used_at=datetime.now(UTC))
-            )
-            await session.commit()
+    # Batch _mark_used updates to reduce DB round-trips under load.
+    # Accumulated IDs are flushed every _MARK_FLUSH_INTERVAL or when batch is full.
+    _mark_pending: set[str] = set()
+    _mark_lock: asyncio.Lock = asyncio.Lock()
+    _MARK_BATCH_SIZE: int = 20
+    _MARK_FLUSH_INTERVAL: float = 5.0  # seconds
+
+    @classmethod
+    async def _mark_used(cls, bot_account_id: str) -> None:
+        async with cls._mark_lock:
+            cls._mark_pending.add(bot_account_id)
+            if len(cls._mark_pending) >= cls._MARK_BATCH_SIZE:
+                await cls._flush_mark_used()
+
+    @classmethod
+    async def _flush_mark_used(cls) -> None:
+        """Flush all pending _mark_used updates in a single DB round-trip."""
+        if not cls._mark_pending:
+            return
+        ids = list(cls._mark_pending)
+        cls._mark_pending.clear()
+        try:
+            async with async_session_factory() as session:
+                await session.execute(
+                    update(BotAccount)
+                    .where(BotAccount.id.in_(ids))
+                    .values(last_used_at=datetime.now(UTC))
+                )
+                await session.commit()
+        except Exception as exc:
+            logger.warning("Failed to batch-update last_used_at for %d bots: %s", len(ids), exc)

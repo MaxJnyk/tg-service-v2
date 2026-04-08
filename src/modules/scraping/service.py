@@ -19,7 +19,14 @@ from collections import defaultdict
 from statistics import median
 from typing import Any
 
-from telethon.errors import FloodWaitError, UserBannedInChannelError
+from telethon.errors import (
+    ChannelInvalidError,
+    ChannelPrivateError,
+    FloodWaitError,
+    UsernameInvalidError,
+    UsernameNotOccupiedError,
+    UserBannedInChannelError,
+)
 from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.tl.types import ChatFull
 
@@ -57,7 +64,26 @@ class ScrapingService:
                 try:
                     result = await self._do_scrape(client, session, username)
                     await self._pool.mark_used(session.id)
+                    await self._pool.release_session(session.id)
                     return result
+
+                except (UsernameNotOccupiedError, UsernameInvalidError, ChannelInvalidError, ValueError) as exc:
+                    # Channel doesn't exist or username invalid — session is fine, no point retrying
+                    await self._pool.mark_used(session.id)
+                    await self._pool.release_session(session.id)
+                    raise SessionError(
+                        str(exc),
+                        error_code=error_codes.SESSION_NOT_AVAILABLE,
+                    ) from exc
+
+                except ChannelPrivateError as exc:
+                    # Private channel — session is fine, no point retrying
+                    await self._pool.mark_used(session.id)
+                    await self._pool.release_session(session.id)
+                    raise SessionError(
+                        f"Channel @{username} is private",
+                        error_code=error_codes.SESSION_NOT_AVAILABLE,
+                    ) from exc
 
                 except FloodWaitError as exc:
                     last_exc = exc
@@ -81,7 +107,15 @@ class ScrapingService:
 
                 except Exception as exc:
                     last_exc = exc
+                    exc_str = str(exc)
                     await self._pool.mark_session_failed(session.id)
+                    if "frozen" in exc_str.lower() or "ACCOUNT_FROZEN" in exc_str:
+                        # Frozen account — no point retrying, mark and raise immediately
+                        logger.warning("Session %s is frozen, marking as failed", session.phone)
+                        raise SessionError(
+                            f"Account frozen: {exc}",
+                            error_code=error_codes.SESSION_NOT_AVAILABLE,
+                        ) from exc
                     logger.warning(
                         "Session %s error: %s (attempt %d/%d)",
                         session.phone, exc, attempt + 1, _MAX_SCRAPE_RETRIES,
@@ -230,7 +264,7 @@ class ScrapingService:
             "reactions_count": reactions_count,
             "forwards_count": forwards_count,
             "replies_count": replies_count,
-            "men_percent": 0,
+            "men_percent": None,
             "daily_metrics": [
                 {
                     "date": day_key,

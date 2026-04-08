@@ -22,6 +22,8 @@ import sentry_sdk
 from prometheus_client import start_http_server
 
 from src.config import settings
+import src.core.healthcheck as healthcheck_mod
+from src.core.healthcheck import start_healthcheck_server
 from src.core.logging import setup_logging
 from src.core.metrics import service_up
 from src.infrastructure.database import close_engine
@@ -67,14 +69,18 @@ def _register_handlers(router: TopicRouter) -> None:
 async def _shutdown(
     consumer: KafkaTaskConsumer,
     producer: KafkaResultProducer,
-    loop: asyncio.AbstractEventLoop,
+    main_task: asyncio.Task,
 ) -> None:
     """Graceful shutdown — 5 steps."""
     logger.info("SHUTDOWN [1/5] Stopping consumer (no new messages)...")
     await consumer.stop()
 
     logger.info("SHUTDOWN [2/5] Waiting for current tasks to finish (timeout=%ds)...", settings.SHUTDOWN_TIMEOUT)
-    await asyncio.sleep(0.5)  # Allow in-flight task to complete
+    await asyncio.sleep(0.5)  # Allow in-flight tasks to complete
+
+    logger.info("SHUTDOWN [2.5/5] Flushing pending bot usage updates...")
+    from src.modules.posting.service import PostingService
+    await PostingService._flush_mark_used()
 
     logger.info("SHUTDOWN [3/5] Closing Telegram pools...")
     await bot_pool.close_all()
@@ -88,7 +94,7 @@ async def _shutdown(
     await close_redis()
 
     logger.info("Shutdown complete.")
-    loop.stop()
+    main_task.cancel()
 
 
 async def main() -> None:
@@ -122,9 +128,14 @@ async def main() -> None:
     )
     await consumer.start()
 
+    # Healthcheck server (readiness probe) on METRICS_PORT + 1
+    healthcheck_mod._consumer_ref = consumer
+    _health_server = await start_healthcheck_server(settings.METRICS_PORT + 1)
+
     # Signal handlers for graceful shutdown
     loop = asyncio.get_running_loop()
-    shutdown = lambda: asyncio.create_task(_shutdown(consumer, producer, loop))  # noqa: E731
+    main_task = asyncio.current_task()
+    shutdown = lambda: asyncio.create_task(_shutdown(consumer, producer, main_task))  # noqa: E731
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, shutdown)
 

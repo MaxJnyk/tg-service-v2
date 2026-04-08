@@ -1,7 +1,8 @@
 """
-Import X-Pay format accounts into tg-service-v2.
+Import format accounts into tg-service-v2.
 
-X-Pay format:
+
+format:
   +14244371383.session  — SQLite Telethon session file
   +14244371383.json     — device fingerprint (app_id, app_hash, device, sdk, etc.)
   Proxies_*.txt         — host:port:user:pass per line (HTTP proxies)
@@ -11,9 +12,12 @@ Usage:
 """
 
 import asyncio
+import itertools
 import json
 import logging
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
@@ -26,7 +30,6 @@ def convert_session_file(session_path: Path) -> str:
     from telethon.sessions import SQLiteSession, StringSession
 
     # Copy to temp path (telethon needs .session extension)
-    import tempfile, shutil
     with tempfile.TemporaryDirectory() as tmp:
         tmp_path = Path(tmp) / "session.session"
         shutil.copy(session_path, tmp_path)
@@ -72,7 +75,7 @@ async def import_all(folder: Path) -> None:
 
     # 2. Load sessions
     session_files = sorted(folder.glob("*.session"))
-    proxy_cycle = iter(proxy_ids) if proxy_ids else iter([None] * 100)
+    proxy_cycle = itertools.cycle(proxy_ids) if proxy_ids else itertools.repeat(None)
 
     for session_file in session_files:
         phone = session_file.stem  # e.g. +14244371383

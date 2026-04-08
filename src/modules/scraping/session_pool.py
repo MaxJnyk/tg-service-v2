@@ -27,7 +27,8 @@ class SessionPool:
         self._pool: dict[str, TelegramClient] = {}  # session_id -> client
         self._max_size = max_size
         self._round_robin_index = 0
-        self._lock = asyncio.Lock()  # Guards pool dict mutations
+        self._lock = asyncio.Lock()  # Guards pool dict mutations + round-robin
+        self._busy: set[str] = set()  # session_ids currently in use
 
     async def get_session(self, role: str = "scrape", _retry_depth: int = 0) -> tuple[TelegramClient, TelegramSession]:
         """Get an active session for the given role. Creates client if not in pool."""
@@ -47,10 +48,23 @@ class SessionPool:
             if not sessions:
                 raise NoAvailableSessionError(f"No active sessions with role={role}")
 
-            # Round-robin
-            idx = self._round_robin_index % len(sessions)
-            self._round_robin_index += 1
-            session = sessions[idx]
+            # Round-robin, skip sessions currently in use by another task
+            async with self._lock:
+                session = None
+                for i in range(len(sessions)):
+                    idx = (self._round_robin_index + i) % len(sessions)
+                    candidate = sessions[idx]
+                    if candidate.id not in self._busy:
+                        session = candidate
+                        self._round_robin_index = idx + 1
+                        self._busy.add(session.id)
+                        break
+                if session is None:
+                    # All sessions busy — fall back to round-robin (allow sharing)
+                    idx = self._round_robin_index % len(sessions)
+                    self._round_robin_index += 1
+                    session = sessions[idx]
+                    self._busy.add(session.id)
 
             # Load proxy — sticky binding: each session MUST use its assigned proxy.
             # Telegram tracks IP changes; connecting without proxy exposes server IP.
@@ -101,12 +115,18 @@ class SessionPool:
 
         return self._pool[session.id], session
 
+    async def release_session(self, session_id: str) -> None:
+        """Release a session back to the pool (no longer busy)."""
+        async with self._lock:
+            self._busy.discard(session_id)
+
     async def mark_flood_wait(self, session_id: str, wait_seconds: int) -> None:
         """Mark session with flood wait cooldown."""
         until = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=wait_seconds)
         await self._mark_session_flood(session_id, until)
 
         async with self._lock:
+            self._busy.discard(session_id)
             if session_id in self._pool:
                 del self._pool[session_id]
 
@@ -123,6 +143,7 @@ class SessionPool:
                     session.status = "banned"
                     logger.warning("Session %s marked as banned after %d failures", session.phone, session.fail_count)
                     async with self._lock:
+                        self._busy.discard(session_id)
                         if session_id in self._pool:
                             del self._pool[session_id]
                 await db.commit()

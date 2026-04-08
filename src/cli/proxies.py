@@ -120,9 +120,12 @@ def _parse_proxy_line(line: str) -> dict:
 
     # Host:port
     host, port_str = line.rsplit(":", 1)
+    port = int(port_str)
+    if not (1 <= port <= 65535):
+        raise ValueError(f"Port {port} out of valid range (1-65535)")
     return {
         "host": host,
-        "port": int(port_str),
+        "port": port,
         "protocol": protocol,
         "username": username,
         "password": password,
