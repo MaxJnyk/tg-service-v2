@@ -17,11 +17,12 @@ Lifecycle:
 import asyncio
 import logging
 import signal
-import sys
 
 from prometheus_client import start_http_server
 
 from src.config import settings
+from src.core.logging import setup_logging
+from src.core.metrics import service_up
 from src.infrastructure.database import close_engine
 from src.infrastructure.redis import close_redis
 from src.modules.posting.bot_pool import BotPool
@@ -34,11 +35,7 @@ from src.transport.consumer import KafkaTaskConsumer
 from src.transport.producer import KafkaResultProducer
 from src.transport.router import TopicRouter
 
-logging.basicConfig(
-    level=getattr(logging, settings.LOG_LEVEL.upper()),
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    stream=sys.stdout,
-)
+setup_logging()
 logger = logging.getLogger("tg-service-v2")
 
 
@@ -119,6 +116,9 @@ async def main() -> None:
             sig,
             lambda: asyncio.create_task(_shutdown(consumer, producer, loop)),
         )
+
+    # Mark service as healthy
+    service_up.set(1)
 
     # Main loop
     logger.info("tg-service-v2 is running. Waiting for Kafka messages...")
