@@ -22,6 +22,14 @@ import sys
 from prometheus_client import start_http_server
 
 from src.config import settings
+from src.infrastructure.database import close_engine
+from src.infrastructure.redis import close_redis
+from src.modules.posting.bot_pool import BotPool
+from src.modules.posting.handlers import create_posting_handlers
+from src.modules.posting.service import PostingService
+from src.modules.scraping.handlers import create_scraping_handlers
+from src.modules.scraping.service import ScrapingService
+from src.modules.scraping.session_pool import SessionPool
 from src.transport.consumer import KafkaTaskConsumer
 from src.transport.producer import KafkaResultProducer
 from src.transport.router import TopicRouter
@@ -34,23 +42,26 @@ logging.basicConfig(
 logger = logging.getLogger("tg-service-v2")
 
 
+# Global instances
+bot_pool = BotPool(max_size=settings.BOT_POOL_MAX_SIZE)
+session_pool = SessionPool(max_size=settings.SESSION_POOL_MAX_SIZE)
+
+
 def _register_handlers(router: TopicRouter) -> None:
     """Register topic handlers. Add new handlers here as modules are built."""
-    # Day 4: posting handlers
-    # from src.modules.posting.handlers import (
-    #     handle_send_bot_message,
-    #     handle_edit_bot_message,
-    #     handle_delete_bot_message,
-    # )
-    # router.register("send_bot_message", handle_send_bot_message)
-    # router.register("edit_bot_message", handle_edit_bot_message)
-    # router.register("delete_bot_message", handle_delete_bot_message)
+    # Posting handlers (Day 4)
+    posting_service = PostingService(bot_pool)
+    posting_handlers = create_posting_handlers(posting_service)
+    for topic, handler in posting_handlers.items():
+        router.register(topic, handler)
 
-    # Day 7: scraping handlers
-    # from src.modules.scraping.handlers import handle_scrape_platform
-    # router.register("scrape_platform", handle_scrape_platform)
+    # Scraping handlers (Day 5-7)
+    scraping_service = ScrapingService(session_pool)
+    scraping_handlers = create_scraping_handlers(scraping_service)
+    for topic, handler in scraping_handlers.items():
+        router.register(topic, handler)
 
-    logger.info("Handlers registered (currently: %d)", len(router._handlers))
+    logger.info("Handlers registered: %d", len(router._handlers))
 
 
 async def _shutdown(
@@ -66,13 +77,15 @@ async def _shutdown(
     await asyncio.sleep(0.5)  # Allow in-flight task to complete
 
     logger.info("SHUTDOWN [3/5] Closing Telegram pools...")
-    # Will be filled in Day 4+
+    await bot_pool.close_all()
+    await session_pool.close_all()
 
     logger.info("SHUTDOWN [4/5] Stopping producer...")
     await producer.stop()
 
     logger.info("SHUTDOWN [5/5] Closing DB + Redis connections...")
-    # Will be filled in Day 3
+    await close_engine()
+    await close_redis()
 
     logger.info("Shutdown complete.")
     loop.stop()
