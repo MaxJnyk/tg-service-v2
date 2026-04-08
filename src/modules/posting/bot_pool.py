@@ -4,7 +4,9 @@ Bot pool — lazy-loads aiogram Bot instances from encrypted tokens in DB.
 
 import logging
 
+import aiohttp
 from aiogram import Bot
+from aiogram.client.session.aiohttp import AiohttpSession
 
 from sqlalchemy import select
 
@@ -38,7 +40,9 @@ class BotPool:
                 raise ValueError(f"Bot account {bot_account_id} not found or inactive")
 
             token = decrypt(account.bot_token)
-            bot = Bot(token=token)
+            connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver())
+            session = AiohttpSession(connector=connector)
+            bot = Bot(token=token, session=session)
             self._pool[bot_account_id] = bot
             logger.info("Loaded bot into pool: %s (pool size: %d)", account.name, len(self._pool))
             return bot

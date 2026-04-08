@@ -1,6 +1,6 @@
 services:
   tg-service:
-    image: tg-service-v2:fixed
+    image: tg-service-v2:latest
     container_name: tg-service-v2
     env_file:
       - .env
