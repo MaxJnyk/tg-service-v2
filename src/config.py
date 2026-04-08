@@ -35,9 +35,15 @@ class Settings(BaseSettings):
     # Scraping
     MAX_MSG_ANALYZE: int = 200
 
+    # Consumer concurrency (0 = sequential, N = max N tasks in parallel)
+    CONSUMER_CONCURRENCY: int = 10
+
     # Monitoring
     LOG_LEVEL: str = "INFO"
     METRICS_PORT: int = 9090
+
+    # Sentry (error tracking + alerting)
+    SENTRY_DSN: str = ""  # Leave empty to disable Sentry
 
     # Graceful shutdown
     SHUTDOWN_TIMEOUT: int = 30

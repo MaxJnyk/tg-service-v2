@@ -5,9 +5,9 @@ Tests for posting Kafka handlers — send, edit, delete.
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
 
+from src.core.exceptions import BotError
 from src.modules.posting.handlers import create_posting_handlers
 from src.modules.posting.service import PostingService
-from src.core.exceptions import BotError
 
 
 @pytest.fixture

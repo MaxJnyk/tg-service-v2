@@ -1,18 +1,29 @@
 """
-Kafka task consumer — subscribes to topics, deserializes, dispatches, manual commit.
+Kafka task consumer — subscribes to topics, deserializes, dispatches.
 
 Key design decisions:
-  - enable_auto_commit=False — we commit AFTER successful processing
-  - On handler error: classify → send error result → commit (don't lose offset)
-  - group_id from config
+  - enable_auto_commit=True — safe with idempotency guard in handlers
+  - Concurrent processing: up to CONSUMER_CONCURRENCY tasks in parallel via Semaphore
+  - At-least-once delivery: idempotency guard prevents double-execution on redelivery
+  - Scale horizontally: more replicas + Kafka partitions
+  - On handler error: classify → send error result (don't block queue)
 """
 
 import asyncio
 import logging
+import time
 from typing import Any
 
+import orjson
 from aiokafka import AIOKafkaConsumer
 
+from src.config import settings
+from src.core.metrics import (
+    kafka_messages_errors,
+    kafka_messages_processed,
+    kafka_messages_received,
+    kafka_processing_duration,
+)
 from src.transport.producer import KafkaResultProducer
 from src.transport.router import TopicRouter
 from src.transport.schemas import TaskRequestSchema
@@ -36,40 +47,69 @@ class KafkaTaskConsumer:
         self._producer = producer
         self._consumer: AIOKafkaConsumer | None = None
         self._running = False
-        self._semaphore = asyncio.Semaphore(100)  # Max 100 concurrent tasks
+        self._semaphore = asyncio.Semaphore(settings.CONSUMER_CONCURRENCY or 1)
+        self._tasks: set[asyncio.Task] = set()
 
     async def start(self) -> None:
         self._consumer = AIOKafkaConsumer(
             *self._topics,
             bootstrap_servers=self._bootstrap_servers,
             group_id=self._group_id,
-            enable_auto_commit=False,
+            enable_auto_commit=True,
             auto_offset_reset="earliest",
             value_deserializer=self._deserialize,
         )
         await self._consumer.start()
         self._running = True
         logger.info(
-            "Connected to Kafka, listening topics: %s (group_id=%s)",
+            "Connected to Kafka, listening topics: %s (group_id=%s, concurrency=%d)",
             self._topics,
             self._group_id,
+            settings.CONSUMER_CONCURRENCY,
         )
 
     async def stop(self) -> None:
         self._running = False
+        if self._tasks:
+            logger.info("Waiting for %d in-flight tasks to finish...", len(self._tasks))
+            await asyncio.gather(*self._tasks, return_exceptions=True)
         if self._consumer:
             await self._consumer.stop()
             logger.info("KafkaTaskConsumer stopped")
 
     @staticmethod
     def _deserialize(value: bytes) -> dict[str, Any]:
-        import json
-        return json.loads(value.decode("utf-8"))
+        return orjson.loads(value)
 
-    async def _process_message(self, msg) -> None:
-        """Process single message with semaphore-controlled concurrency."""
+    async def consume_loop(self) -> None:
+        """Concurrent consume loop with semaphore-based concurrency control.
+
+        At-least-once + idempotency:
+          - auto_commit=True (Kafka handles offsets)
+          - Idempotency guard in each handler prevents double-execution
+          - On crash: Kafka redelivers → idempotency guard skips duplicates
+
+        Throughput: up to CONSUMER_CONCURRENCY tasks in parallel.
+        Telegram rate limiter (shared Redis) prevents API abuse.
+        """
+        if not self._consumer:
+            raise RuntimeError("Consumer not started")
+
+        async for msg in self._consumer:
+            if not self._running:
+                break
+
+            task = asyncio.create_task(self._process_message(msg))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    async def _process_message(self, msg: Any) -> None:
+        """Process a single Kafka message under semaphore concurrency limit."""
         async with self._semaphore:
             topic = msg.topic
+            kafka_messages_received.labels(topic=topic).inc()
+            t0 = time.monotonic()
+
             try:
                 request = TaskRequestSchema.model_validate(msg.value)
                 logger.info(
@@ -78,8 +118,11 @@ class KafkaTaskConsumer:
                     request.request_id,
                 )
                 await self._router.dispatch(topic, request, self._producer)
+                kafka_messages_processed.labels(topic=topic).inc()
+
             except Exception as exc:
                 logger.exception("Error processing message from %s: %s", topic, exc)
+                kafka_messages_errors.labels(topic=topic, error_code="INTERNAL_ERROR").inc()
                 try:
                     request_id = msg.value.get("request_id", "unknown") if isinstance(msg.value, dict) else "unknown"
                     callback = msg.value.get("callback_task_name") if isinstance(msg.value, dict) else None
@@ -96,38 +139,6 @@ class KafkaTaskConsumer:
                 except Exception as send_exc:
                     logger.exception("Failed to send error result: %s", send_exc)
 
-    async def consume_loop(self) -> None:
-        if not self._consumer:
-            raise RuntimeError("Consumer not started")
-
-        _MAX_PENDING = 100  # Matches semaphore — prevents unbounded task accumulation
-        pending_tasks: set[asyncio.Task] = set()
-
-        async for msg in self._consumer:
-            if not self._running:
-                break
-
-            # Create task for concurrent processing (semaphore limits actual concurrency)
-            task = asyncio.create_task(self._process_message(msg))
-            pending_tasks.add(task)
-
-            # Clean up completed tasks and commit their offsets
-            done_tasks = {t for t in pending_tasks if t.done()}
-            if done_tasks:
-                pending_tasks -= done_tasks
-                await self._consumer.commit()
-                logger.debug("Committed %d completed tasks (pending=%d)", len(done_tasks), len(pending_tasks))
-
-            # Back-pressure: wait for all tasks when we hit the cap
-            # This prevents unbounded memory growth if Kafka produces faster than we process
-            if len(pending_tasks) >= _MAX_PENDING:
-                await asyncio.gather(*pending_tasks, return_exceptions=True)
-                pending_tasks.clear()
-                await self._consumer.commit()
-                logger.debug("Committed full batch of %d messages", _MAX_PENDING)
-
-        # Wait for remaining tasks before shutdown
-        if pending_tasks:
-            logger.info("Draining %d remaining tasks before shutdown", len(pending_tasks))
-            await asyncio.gather(*pending_tasks, return_exceptions=True)
-            await self._consumer.commit()
+            finally:
+                elapsed = time.monotonic() - t0
+                kafka_processing_duration.labels(topic=topic).observe(elapsed)

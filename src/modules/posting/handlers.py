@@ -5,14 +5,15 @@ Kafka handlers for posting topics:
   - delete_bot_message
 
 Each handler:
-  1. Parses payload from TaskRequestSchema
-  2. Calls PostingService
-  3. Sends result back via KafkaResultProducer
+  1. Checks idempotency (all operations — prevents Kafka redelivery issues)
+  2. Parses payload from TaskRequestSchema
+  3. Calls PostingService
+  4. Sends result back via KafkaResultProducer
 """
 
 import logging
 
-from src.core.exceptions import NoAvailableBotError, TelegramServiceError
+from src.core.exceptions import TelegramServiceError
 from src.infrastructure.redis import get_redis
 from src.modules.posting.service import PostingService
 from src.transport.producer import KafkaResultProducer
@@ -31,6 +32,28 @@ async def _check_idempotency(request_id: str) -> bool:
     return result is None  # None means key already existed → duplicate
 
 
+async def _send_error(
+    topic: str,
+    request: TaskRequestSchema,
+    producer: KafkaResultProducer,
+    exc: TelegramServiceError,
+) -> None:
+    """Send error result — shared by all posting handlers."""
+    logger.error("%s failed: %s (code=%s)", topic, exc, exc.error_code)
+    await producer.send_result(
+        original_topic=topic,
+        request=request,
+        error=f"[{exc.error_code}] {exc}",
+    )
+
+
+def _parse_platform_and_chat(payload: dict) -> tuple[dict, str | int]:
+    """Extract platform dict and resolved chat_id from handler payload."""
+    platform = payload.get("platform", {})
+    raw_chat = platform.get("internal_id") or platform.get("url", "")
+    return platform, PostingService.resolve_chat_id(raw_chat)
+
+
 def create_posting_handlers(posting_service: PostingService) -> dict:
     """Create handler functions that close over the posting service."""
 
@@ -43,60 +66,38 @@ def create_posting_handlers(posting_service: PostingService) -> dict:
             return
 
         payload = request.payload or {}
-        platform = payload.get("platform", {})
+        platform, chat_id = _parse_platform_and_chat(payload)
         message = payload.get("message", {})
-
-        raw_chat = platform.get("internal_id") or platform.get("url", "")
-        chat_id = PostingService.resolve_chat_id(raw_chat)
-        text = message.get("text", "")
-        media = message.get("media")
-        markup = message.get("markup")
-        parse_mode = message.get("parse_mode")
 
         try:
             result = await posting_service.send_message(
                 chat_id=chat_id,
-                text=text,
+                text=message.get("text", ""),
                 platform_id=str(platform.get("id", "")),
-                media=media,
-                markup=markup,
-                parse_mode=parse_mode,
+                media=message.get("media"),
+                markup=message.get("markup"),
+                parse_mode=message.get("parse_mode"),
             )
             await producer.send_result(
                 original_topic="send_bot_message",
                 request=request,
                 payload=result,
             )
-        except NoAvailableBotError as exc:
-            logger.error("send_bot_message: no active bot available")
-            await producer.send_result(
-                original_topic="send_bot_message",
-                request=request,
-                error=f"[{exc.error_code}] {exc}",
-            )
         except TelegramServiceError as exc:
-            logger.error("send_bot_message failed: %s (code=%s)", exc, exc.error_code)
-            await producer.send_result(
-                original_topic="send_bot_message",
-                request=request,
-                error=f"[{exc.error_code}] {exc}",
-            )
+            await _send_error("send_bot_message", request, producer, exc)
 
     async def handle_edit_bot_message(
         request: TaskRequestSchema,
         producer: KafkaResultProducer,
     ) -> None:
-        payload = request.payload or {}
-        platform = payload.get("platform", {})
-        message = payload.get("message", {})
+        if await _check_idempotency(str(request.request_id)):
+            logger.warning("edit_bot_message: duplicate request_id=%s, skipping", request.request_id)
+            return
 
-        raw_chat = platform.get("internal_id") or platform.get("url", "")
-        chat_id = PostingService.resolve_chat_id(raw_chat)
+        payload = request.payload or {}
+        platform, chat_id = _parse_platform_and_chat(payload)
+        message = payload.get("message", {})
         message_id = payload.get("message_id") or message.get("message_id")
-        text = message.get("text", "")
-        media = message.get("media")
-        markup = message.get("markup")
-        parse_mode = message.get("parse_mode")
 
         if not message_id:
             await producer.send_result(
@@ -110,42 +111,31 @@ def create_posting_handlers(posting_service: PostingService) -> dict:
             result = await posting_service.edit_message(
                 chat_id=chat_id,
                 message_id=int(message_id),
-                text=text,
+                text=message.get("text", ""),
                 platform_id=str(platform.get("id", "")),
-                media=media,
-                markup=markup,
-                parse_mode=parse_mode,
+                media=message.get("media"),
+                markup=message.get("markup"),
+                parse_mode=message.get("parse_mode"),
             )
             await producer.send_result(
                 original_topic="edit_bot_message",
                 request=request,
                 payload=result,
             )
-        except NoAvailableBotError as exc:
-            logger.error("edit_bot_message: no active bot available")
-            await producer.send_result(
-                original_topic="edit_bot_message",
-                request=request,
-                error=f"[{exc.error_code}] {exc}",
-            )
         except TelegramServiceError as exc:
-            logger.error("edit_bot_message failed: %s (code=%s)", exc, exc.error_code)
-            await producer.send_result(
-                original_topic="edit_bot_message",
-                request=request,
-                error=f"[{exc.error_code}] {exc}",
-            )
+            await _send_error("edit_bot_message", request, producer, exc)
 
     async def handle_delete_bot_message(
         request: TaskRequestSchema,
         producer: KafkaResultProducer,
     ) -> None:
-        payload = request.payload or {}
-        platform = payload.get("platform", {})
-        message = payload.get("message", {})
+        if await _check_idempotency(str(request.request_id)):
+            logger.warning("delete_bot_message: duplicate request_id=%s, skipping", request.request_id)
+            return
 
-        raw_chat = platform.get("internal_id") or platform.get("url", "")
-        chat_id = PostingService.resolve_chat_id(raw_chat)
+        payload = request.payload or {}
+        platform, chat_id = _parse_platform_and_chat(payload)
+        message = payload.get("message", {})
         message_id = message.get("message_id")
 
         if not message_id:
@@ -167,20 +157,8 @@ def create_posting_handlers(posting_service: PostingService) -> dict:
                 request=request,
                 payload=result,
             )
-        except NoAvailableBotError as exc:
-            logger.error("delete_bot_message: no active bot available")
-            await producer.send_result(
-                original_topic="delete_bot_message",
-                request=request,
-                error=f"[{exc.error_code}] {exc}",
-            )
         except TelegramServiceError as exc:
-            logger.error("delete_bot_message failed: %s (code=%s)", exc, exc.error_code)
-            await producer.send_result(
-                original_topic="delete_bot_message",
-                request=request,
-                error=f"[{exc.error_code}] {exc}",
-            )
+            await _send_error("delete_bot_message", request, producer, exc)
 
     return {
         "send_bot_message": handle_send_bot_message,

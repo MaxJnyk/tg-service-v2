@@ -5,7 +5,7 @@ Telegram limits:
   - Global: 30 messages/second across all chats
   - Per-chat: 1 message/second (Telegram silently drops/delays otherwise)
 
-Uses sliding window via Redis sorted sets (ZADD/ZRANGEBYSCORE).
+Uses atomic Lua script for check-and-acquire in a single round-trip.
 All workers share the same Redis → cluster-safe.
 """
 
@@ -23,10 +23,42 @@ _PER_CHAT_LIMIT = 1         # msg/sec per chat
 _WINDOW_SEC = 1.0
 _MAX_WAIT_SEC = 10.0        # give up after 10s waiting for slot
 
+# Lua script: atomic check-and-acquire (no race condition between check and add)
+_ACQUIRE_LUA = """
+local global_key = KEYS[1]
+local chat_key   = KEYS[2]
+local window_start  = tonumber(ARGV[1])
+local now           = tonumber(ARGV[2])
+local global_limit  = tonumber(ARGV[3])
+local chat_limit    = tonumber(ARGV[4])
+local member        = ARGV[5]
+
+-- Clean old entries
+redis.call('ZREMRANGEBYSCORE', global_key, '-inf', window_start)
+redis.call('ZREMRANGEBYSCORE', chat_key, '-inf', window_start)
+
+-- Check counts
+local global_count = redis.call('ZCARD', global_key)
+local chat_count   = redis.call('ZCARD', chat_key)
+
+if global_count >= global_limit or chat_count >= chat_limit then
+    return 0
+end
+
+-- Add our slot (atomic with the check above)
+redis.call('ZADD', global_key, now, member)
+redis.call('EXPIRE', global_key, 5)
+redis.call('ZADD', chat_key, now, member)
+redis.call('EXPIRE', chat_key, 5)
+return 1
+"""
+
 
 class RateLimiter:
     """
     Two-level sliding-window rate limiter backed by Redis.
+
+    Uses a single Lua script for atomic check+acquire — safe under concurrency.
 
     Usage:
         await rate_limiter.acquire(chat_id="@channel")
@@ -35,6 +67,7 @@ class RateLimiter:
 
     def __init__(self, redis: Redis) -> None:
         self._redis = redis
+        self._script = redis.register_script(_ACQUIRE_LUA)
 
     async def acquire(self, chat_id: str) -> None:
         """
@@ -59,34 +92,17 @@ class RateLimiter:
 
     async def _try_acquire(self, now: float, chat_id: str) -> bool:
         """
-        Atomically check and record a slot in both global and per-chat windows.
-        Returns True if acquired, False if either window is full.
+        Atomically check and record a slot via Lua script.
+        Single Redis round-trip — no race condition.
         """
         global_key = "tg_rl:global"
         chat_key = f"tg_rl:chat:{chat_id}"
         window_start = now - _WINDOW_SEC
-        member = str(now)
+        # Unique member: timestamp + chat_id to avoid collisions in sorted set
+        member = f"{now}:{chat_id}"
 
-        pipe = self._redis.pipeline(transaction=True)
-        # Clean old entries
-        pipe.zremrangebyscore(global_key, "-inf", window_start)
-        pipe.zremrangebyscore(chat_key, "-inf", window_start)
-        # Count current window
-        pipe.zcard(global_key)
-        pipe.zcard(chat_key)
-        results = await pipe.execute()
-
-        global_count = results[2]
-        chat_count = results[3]
-
-        if global_count >= _GLOBAL_LIMIT or chat_count >= _PER_CHAT_LIMIT:
-            return False
-
-        # Add our slot
-        pipe = self._redis.pipeline(transaction=True)
-        pipe.zadd(global_key, {member: now})
-        pipe.expire(global_key, 5)
-        pipe.zadd(chat_key, {member: now})
-        pipe.expire(chat_key, 5)
-        await pipe.execute()
-        return True
+        result = await self._script(
+            keys=[global_key, chat_key],
+            args=[window_start, now, _GLOBAL_LIMIT, _PER_CHAT_LIMIT, member],
+        )
+        return bool(result)

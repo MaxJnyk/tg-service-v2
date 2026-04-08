@@ -34,70 +34,105 @@ logger = logging.getLogger(__name__)
 # Global semaphore: max 10 concurrent scraping operations (prevent mass FloodWait)
 _SCRAPING_SEM = asyncio.Semaphore(10)
 
+_MAX_SCRAPE_RETRIES = 3
+_SCRAPE_BACKOFF = [1, 2, 4]
+
 
 class ScrapingService:
     def __init__(self, session_pool: SessionPool) -> None:
         self._pool = session_pool
 
     async def scrape_platform(self, username: str, platform_id: str | None = None) -> dict[str, Any]:
-        """Scrape channel stats — compatible with tad-backend save_parsing_results."""
+        """Scrape channel stats — compatible with tad-backend save_parsing_results.
+
+        Retries up to 3 times with different sessions on FloodWait/failure.
+        """
         scraping_operations.inc()
 
-        async with _SCRAPING_SEM:  # Limit concurrent scraping (prevent mass FloodWait)
-            client, session = await self._pool.get_session(role="scrape")
-            try:
-                entity = await client.get_entity(username)
+        async with _SCRAPING_SEM:
+            last_exc: Exception | None = None
 
-                full: ChatFull = await client(GetFullChannelRequest(entity))
-                full_chat = full.full_chat
-                chat = full.chats[0]
+            for attempt in range(_MAX_SCRAPE_RETRIES):
+                client, session = await self._pool.get_session(role="scrape")
+                try:
+                    result = await self._do_scrape(client, session, username)
+                    await self._pool.mark_used(session.id)
+                    return result
 
-                # --- Common info ---
-                common_data = {
-                    "title": getattr(chat, "title", ""),
-                    "description": getattr(full_chat, "about", "") or "",
-                    "item_type": "CHANNEL" if getattr(chat, "broadcast", False) else "GROUP",
-                    "external_id": chat.id,
-                    "avatar": None,
-                    "members_count": getattr(full_chat, "participants_count", 0) or 0,
-                }
+                except FloodWaitError as exc:
+                    last_exc = exc
+                    logger.warning(
+                        "FloodWait %ds on session %s (attempt %d/%d), switching session",
+                        exc.seconds, session.phone, attempt + 1, _MAX_SCRAPE_RETRIES,
+                    )
+                    await self._pool.mark_flood_wait(session.id, exc.seconds)
+                    if attempt < _MAX_SCRAPE_RETRIES - 1:
+                        await asyncio.sleep(_SCRAPE_BACKOFF[attempt])
 
-                # --- Stat info (iterate messages) ---
-                stat_data = await self._collect_stat_info(client, chat)
+                except UserBannedInChannelError as exc:
+                    last_exc = exc
+                    await self._pool.mark_session_failed(session.id)
+                    logger.warning(
+                        "Session %s banned (attempt %d/%d), switching session",
+                        session.phone, attempt + 1, _MAX_SCRAPE_RETRIES,
+                    )
+                    if attempt < _MAX_SCRAPE_RETRIES - 1:
+                        await asyncio.sleep(_SCRAPE_BACKOFF[attempt])
 
-                result = {**common_data, **stat_data}
+                except Exception as exc:
+                    last_exc = exc
+                    await self._pool.mark_session_failed(session.id)
+                    logger.warning(
+                        "Session %s error: %s (attempt %d/%d)",
+                        session.phone, exc, attempt + 1, _MAX_SCRAPE_RETRIES,
+                    )
+                    if attempt < _MAX_SCRAPE_RETRIES - 1:
+                        await asyncio.sleep(_SCRAPE_BACKOFF[attempt])
 
-                await self._pool.mark_used(session.id)
-                logger.info(
-                    "Scraped %s: %d members, avg_views_daily=%d, %d daily_metrics",
-                    username,
-                    common_data["members_count"],
-                    stat_data.get("average_views_count_daily", 0),
-                    len(stat_data.get("daily_metrics", [])),
-                )
-                return result
-
-            except FloodWaitError as exc:
-                logger.warning("FloodWait %ds on session %s", exc.seconds, session.phone)
-                await self._pool.mark_flood_wait(session.id, exc.seconds)
+            # All retries exhausted
+            if isinstance(last_exc, FloodWaitError):
                 raise SessionError(
-                    f"FloodWait {exc.seconds}s",
+                    f"FloodWait after {_MAX_SCRAPE_RETRIES} retries",
                     error_code=error_codes.SESSION_FLOOD_WAIT,
-                ) from exc
-
-            except UserBannedInChannelError as exc:
-                await self._pool.mark_session_failed(session.id)
+                ) from last_exc
+            if isinstance(last_exc, UserBannedInChannelError):
                 raise SessionError(
-                    str(exc),
+                    str(last_exc),
                     error_code=error_codes.SESSION_BANNED,
-                ) from exc
+                ) from last_exc
+            raise SessionError(
+                f"All {_MAX_SCRAPE_RETRIES} scrape retries failed: {last_exc}",
+                error_code=error_codes.SESSION_NOT_AVAILABLE,
+            ) from last_exc
 
-            except Exception as exc:
-                await self._pool.mark_session_failed(session.id)
-                raise SessionError(
-                    str(exc),
-                    error_code=error_codes.SESSION_NOT_AVAILABLE,
-                ) from exc
+    async def _do_scrape(self, client: Any, session: Any, username: str) -> dict[str, Any]:
+        """Execute a single scrape attempt."""
+        entity = await client.get_entity(username)
+
+        full: ChatFull = await client(GetFullChannelRequest(entity))
+        full_chat = full.full_chat
+        chat = full.chats[0]
+
+        common_data = {
+            "title": getattr(chat, "title", ""),
+            "description": getattr(full_chat, "about", "") or "",
+            "item_type": "CHANNEL" if getattr(chat, "broadcast", False) else "GROUP",
+            "external_id": chat.id,
+            "avatar": None,
+            "members_count": getattr(full_chat, "participants_count", 0) or 0,
+        }
+
+        stat_data = await self._collect_stat_info(client, chat)
+        result = {**common_data, **stat_data}
+
+        logger.info(
+            "Scraped %s: %d members, avg_views_daily=%d, %d daily_metrics",
+            username,
+            common_data["members_count"],
+            stat_data.get("average_views_count_daily", 0),
+            len(stat_data.get("daily_metrics", [])),
+        )
+        return result
 
     @staticmethod
     async def _collect_stat_info(client: Any, chat: Any) -> dict[str, Any]:

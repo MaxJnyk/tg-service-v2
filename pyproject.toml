@@ -25,6 +25,11 @@ dependencies = [
     # Logging & Monitoring
     "structlog>=24.1.0",
     "prometheus-client>=0.20.0",
+    "sentry-sdk>=2.5.0",
+    # Retry & Resilience
+    "tenacity>=8.3.0",
+    # Fast JSON (3-10x faster than stdlib, native UUID/datetime)
+    "orjson>=3.10.0",
     # CLI
     "typer[all]>=0.12.0",
 ]

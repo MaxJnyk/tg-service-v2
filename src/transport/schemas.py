@@ -9,7 +9,6 @@ Schema compatibility is validated by integration tests.
 """
 
 import re
-from functools import cached_property
 from typing import Any
 from uuid import UUID
 
@@ -32,13 +31,13 @@ class PlatformSchema(BaseModel):
     invite_link: str | None = None
     internal_id: str | None = None
 
-    @cached_property
+    @property
     def username(self) -> str | None:
         if self.url:
             return self.url.strip("/").split("/")[-1]
         return None
 
-    @cached_property
+    @property
     def ausername(self) -> str | None:
         if self.url:
             return "@" + self.url.strip("/").split("/")[-1]

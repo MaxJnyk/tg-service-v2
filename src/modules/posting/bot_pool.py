@@ -6,10 +6,12 @@ import logging
 
 from aiogram import Bot
 
-from src.core.security import decrypt
-from src.modules.accounts.models import BotAccount
-from src.infrastructure.database import async_session_factory
 from sqlalchemy import select
+
+from src.core.exceptions import NoAvailableBotError
+from src.core.security import decrypt
+from src.infrastructure.database import async_session_factory
+from src.modules.accounts.models import BotAccount
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +65,6 @@ class BotPool:
                 account = result.scalar_one_or_none()
 
             if not account:
-                from src.core.exceptions import NoAvailableBotError
                 raise NoAvailableBotError()
 
             bot = await self.get_bot(account.id)

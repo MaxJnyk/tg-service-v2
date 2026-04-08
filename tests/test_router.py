@@ -14,13 +14,6 @@ def router():
     return TopicRouter()
 
 
-@pytest.fixture
-def mock_producer():
-    producer = AsyncMock()
-    producer.send_result = AsyncMock()
-    return producer
-
-
 class TestTopicRouter:
     @pytest.mark.asyncio
     async def test_register_and_dispatch(self, router, mock_producer):

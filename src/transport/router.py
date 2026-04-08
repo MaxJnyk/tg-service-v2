@@ -18,6 +18,10 @@ class TopicRouter:
     def __init__(self) -> None:
         self._handlers: dict[str, Handler] = {}
 
+    @property
+    def handler_count(self) -> int:
+        return len(self._handlers)
+
     def register(self, topic: str, handler: Handler) -> None:
         self._handlers[topic] = handler
         logger.info("Registered handler for topic: %s", topic)

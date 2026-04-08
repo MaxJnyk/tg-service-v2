@@ -13,7 +13,7 @@ from aiogram.exceptions import (
     TelegramNotFound,
     TelegramRetryAfter,
 )
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from sqlalchemy import update
 
 from src.core import error_codes
@@ -73,7 +73,7 @@ class PostingService:
         platform_id: str | None = None,
         media: str | None = None,
         markup: list[dict] | None = None,
-        **kwargs: Any,
+        parse_mode: str | None = None,
     ) -> dict[str, Any]:
         """Send a new message (text or photo) to a Telegram chat."""
         posting_operations.labels(operation="send").inc()
@@ -92,14 +92,14 @@ class PostingService:
                         photo=media,
                         caption=text or None,
                         reply_markup=reply_markup,
-                        **kwargs,
+                        parse_mode=parse_mode,
                     )
                 else:
                     msg = await bot.send_message(
                         chat_id=chat_id,
                         text=text,
                         reply_markup=reply_markup,
-                        **kwargs,
+                        parse_mode=parse_mode,
                     )
                 await self._mark_used(account.id)
                 logger.info("Sent message to %s via bot %s, message_id=%d", chat_id, account.name, msg.message_id)
@@ -140,7 +140,7 @@ class PostingService:
         platform_id: str | None = None,
         media: str | None = None,
         markup: list[dict] | None = None,
-        **kwargs: Any,
+        parse_mode: str | None = None,
     ) -> dict[str, Any]:
         """Edit an existing message."""
         posting_operations.labels(operation="edit").inc()
@@ -154,13 +154,11 @@ class PostingService:
             bot, account = await self._bot_pool.get_bot_for_platform(platform_id or "")
             try:
                 if media:
-                    from aiogram.types import InputMediaPhoto
                     await bot.edit_message_media(
                         chat_id=chat_id,
                         message_id=message_id,
                         media=InputMediaPhoto(media=media, caption=text or None),
                         reply_markup=reply_markup,
-                        **kwargs,
                     )
                 else:
                     await bot.edit_message_text(
@@ -168,7 +166,7 @@ class PostingService:
                         message_id=message_id,
                         text=text,
                         reply_markup=reply_markup,
-                        **kwargs,
+                        parse_mode=parse_mode,
                     )
                 await self._mark_used(account.id)
                 logger.info("Edited message %d in %s via bot %s", message_id, chat_id, account.name)

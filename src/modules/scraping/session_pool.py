@@ -5,7 +5,7 @@ Session pool — manages Telethon client lifecycle with round-robin selection.
 import asyncio
 import logging
 import random
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select, update
 from telethon import TelegramClient
@@ -29,7 +29,7 @@ class SessionPool:
         self._round_robin_index = 0
         self._lock = asyncio.Lock()  # Guards pool dict mutations
 
-    async def get_session(self, role: str = "scrape") -> tuple[TelegramClient, TelegramSession]:
+    async def get_session(self, role: str = "scrape", _retry_depth: int = 0) -> tuple[TelegramClient, TelegramSession]:
         """Get an active session for the given role. Creates client if not in pool."""
         async with async_session_factory() as db:
             result = await db.execute(
@@ -52,13 +52,26 @@ class SessionPool:
             self._round_robin_index += 1
             session = sessions[idx]
 
-            # Load proxy if linked
+            # Load proxy — sticky binding: each session MUST use its assigned proxy.
+            # Telegram tracks IP changes; connecting without proxy exposes server IP.
             proxy = None
             if session.proxy_id:
                 proxy_result = await db.execute(
                     select(Proxy).where(Proxy.id == session.proxy_id, Proxy.is_active.is_(True))
                 )
                 proxy = proxy_result.scalar_one_or_none()
+                if proxy is None:
+                    logger.warning(
+                        "Session %s has proxy_id=%s but proxy is inactive/missing — skipping to avoid IP leak",
+                        session.phone, session.proxy_id,
+                    )
+                    # Skip this session, try next one via round-robin (with depth guard)
+                    if _retry_depth >= 10:
+                        raise NoAvailableSessionError("All sessions have dead proxies")
+                    return await self.get_session(role=role, _retry_depth=_retry_depth + 1)
+
+            elif session.proxy_id is None:
+                logger.warning("Session %s has NO proxy assigned — connecting with server IP", session.phone)
 
         # Get or create client; reconnect if connection dropped
         async with self._lock:
@@ -90,9 +103,7 @@ class SessionPool:
 
     async def mark_flood_wait(self, session_id: str, wait_seconds: int) -> None:
         """Mark session with flood wait cooldown."""
-        until = datetime.now(UTC).replace(microsecond=0)
-        from datetime import timedelta
-        until += timedelta(seconds=wait_seconds)
+        until = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=wait_seconds)
         await self._mark_session_flood(session_id, until)
 
         async with self._lock:

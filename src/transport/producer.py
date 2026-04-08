@@ -3,29 +3,20 @@ Kafka result producer — sends TaskResultSchema to result topics.
 
 Result topic pattern: tad_{original_topic}_result
 This matches the regex in tad-backend's broker_async.py: tad_.*_result
+
+Uses orjson for serialization — 3-10x faster than stdlib json,
+native UUID/datetime support (no custom encoder needed).
 """
 
-import json
 import logging
 from typing import Any
-from uuid import UUID
 
+import orjson
 from aiokafka import AIOKafkaProducer
 
 from src.transport.schemas import TaskRequestSchema, TaskResultSchema
 
 logger = logging.getLogger(__name__)
-
-
-class _ExtendedEncoder(json.JSONEncoder):
-    """JSON encoder that handles UUID, datetime, Decimal, etc."""
-
-    def default(self, obj: Any) -> Any:
-        if isinstance(obj, UUID):
-            return str(obj)
-        if isinstance(obj, Exception):
-            return str(obj)
-        return super().default(obj)
 
 
 class KafkaResultProducer:
@@ -36,7 +27,7 @@ class KafkaResultProducer:
     async def start(self) -> None:
         self._producer = AIOKafkaProducer(
             bootstrap_servers=self._bootstrap_servers,
-            value_serializer=lambda v: json.dumps(v, cls=_ExtendedEncoder).encode("utf-8"),
+            value_serializer=lambda v: orjson.dumps(v),
         )
         await self._producer.start()
         logger.info("KafkaResultProducer started, servers=%s", self._bootstrap_servers)

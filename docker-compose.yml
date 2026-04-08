@@ -11,6 +11,12 @@ services:
     restart: unless-stopped
     ports:
       - "9090:9090"  # Prometheus metrics only
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9090/metrics')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   tg-service-db:
     image: postgres:16-alpine

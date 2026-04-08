@@ -18,6 +18,7 @@ import asyncio
 import logging
 import signal
 
+import sentry_sdk
 from prometheus_client import start_http_server
 
 from src.config import settings
@@ -60,7 +61,7 @@ def _register_handlers(router: TopicRouter) -> None:
     for topic, handler in scraping_handlers.items():
         router.register(topic, handler)
 
-    logger.info("Handlers registered: %d", len(router._handlers))
+    logger.info("Handlers registered: %d", router.handler_count)
 
 
 async def _shutdown(
@@ -91,6 +92,16 @@ async def _shutdown(
 
 
 async def main() -> None:
+    # Sentry error tracking (disabled if SENTRY_DSN is empty)
+    if settings.SENTRY_DSN:
+        sentry_sdk.init(
+            dsn=settings.SENTRY_DSN,
+            traces_sample_rate=0.1,  # 10% of transactions for performance monitoring
+            environment="production",
+            release="tg-service-v2@0.1.0",
+        )
+        logger.info("Sentry initialized")
+
     # Prometheus metrics server
     start_http_server(settings.METRICS_PORT)
     logger.info("Prometheus metrics on port %d", settings.METRICS_PORT)
@@ -113,11 +124,9 @@ async def main() -> None:
 
     # Signal handlers for graceful shutdown
     loop = asyncio.get_running_loop()
+    shutdown = lambda: asyncio.create_task(_shutdown(consumer, producer, loop))  # noqa: E731
     for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(
-            sig,
-            lambda: asyncio.create_task(_shutdown(consumer, producer, loop)),
-        )
+        loop.add_signal_handler(sig, shutdown)
 
     # Mark service as healthy
     service_up.set(1)
