@@ -1,6 +1,7 @@
 """
-Structured logging with structlog.
-JSON output for production, colored console for development.
+Структурированные логи через structlog.
+
+JSON-вывод для прода, цветная консоль для разработки (LOG_LEVEL=DEBUG).
 """
 
 import logging
@@ -12,7 +13,7 @@ from src.config import settings
 
 
 def setup_logging() -> None:
-    """Configure structlog + stdlib logging."""
+    """КОнфигурация structlog + stdlib logging."""
     shared_processors: list[structlog.types.Processor] = [
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_log_level,
@@ -23,10 +24,9 @@ def setup_logging() -> None:
     ]
 
     if settings.LOG_LEVEL == "DEBUG":
-        # Dev: colored console output
         renderer = structlog.dev.ConsoleRenderer()
     else:
-        # Production: JSON lines
+        # Прод: JSON-строки (для ELK/Loki)
         renderer = structlog.processors.JSONRenderer()
 
     structlog.configure(
@@ -54,7 +54,7 @@ def setup_logging() -> None:
     root_logger.addHandler(handler)
     root_logger.setLevel(getattr(logging, settings.LOG_LEVEL.upper()))
 
-    # Suppress noisy libs
+    # Глушим шумные библиотеки
     logging.getLogger("aiokafka").setLevel(logging.WARNING)
     logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
     logging.getLogger("telethon").setLevel(logging.WARNING)

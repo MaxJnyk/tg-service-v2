@@ -1,5 +1,5 @@
 """
-Tests for scraping service retry logic.
+Тесты для логики ретраев scraping service.
 """
 
 import pytest
@@ -13,7 +13,7 @@ from src.modules.scraping.service import ScrapingService
 
 def _make_mock_pool():
     pool = AsyncMock()
-    # Return a new mock client+session on each call (simulates switching sessions)
+    # Возвращаем новый мок client+session на каждый вызов (симулируем переключение сессий)
     pool.get_session = AsyncMock(
         side_effect=lambda role: (AsyncMock(), MagicMock(id="sess-1", phone="+1111"))
     )

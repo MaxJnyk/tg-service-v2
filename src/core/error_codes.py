@@ -1,32 +1,34 @@
 """
-Standardized error codes sent back to tad-backend via Kafka result messages.
+Стандартизированные коды ошибок, которые отправляются обратно в tad-backend через Kafka result-сообщения.
+
+Используются в TelegramServiceError.error_code и поле error в TaskResultSchema.
 """
 
-# Transport errors
+# Ошибки транспорта (Kafka)
 NO_HANDLER = "NO_HANDLER"
 INTERNAL_ERROR = "INTERNAL_ERROR"
 INVALID_PAYLOAD = "INVALID_PAYLOAD"
 
-# Telegram bot errors
+# Ошибки Telegram-бота (aiogram)
 BOT_TOKEN_INVALID = "BOT_TOKEN_INVALID"
 BOT_BLOCKED = "BOT_BLOCKED"
 BOT_NOT_ADMIN = "BOT_NOT_ADMIN"
 BOT_RATE_LIMITED = "BOT_RATE_LIMITED"
 BOT_CHAT_NOT_FOUND = "BOT_CHAT_NOT_FOUND"
 
-# Telegram userbot errors
+# Ошибки Telegram-юзербота (Telethon)
 SESSION_BANNED = "SESSION_BANNED"
 SESSION_FLOOD_WAIT = "SESSION_FLOOD_WAIT"
 SESSION_NOT_AVAILABLE = "SESSION_NOT_AVAILABLE"
 
-# Proxy errors
+# Ошибки прокси
 PROXY_DEAD = "PROXY_DEAD"
 PROXY_AUTH_FAILED = "PROXY_AUTH_FAILED"
 
-# Account errors
+# Ошибки аккаунтов (нет активных)
 NO_ACTIVE_BOT = "NO_ACTIVE_BOT"
 NO_ACTIVE_SESSION = "NO_ACTIVE_SESSION"
 ALL_BOTS_FAILED = "ALL_BOTS_FAILED"
 
-# Idempotency
+# Идемпотентность
 DUPLICATE_REQUEST = "DUPLICATE_REQUEST"

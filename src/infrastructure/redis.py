@@ -1,5 +1,7 @@
 """
-Redis connection pool for idempotency, rate limiting, caching.
+Redis-пул коннектов — идемпотентность, rate limiting, кеширование.
+
+Синглтон-пул: создаётся один раз, закрывается при shutdown.
 """
 
 import logging
@@ -18,13 +20,14 @@ def get_redis_pool() -> ConnectionPool:
     if _pool is None:
         _pool = ConnectionPool.from_url(
             settings.REDIS_URL,
-            max_connections=20,
+            max_connections=50,
             decode_responses=True,
         )
     return _pool
 
 
 def get_redis() -> Redis:
+    """Получить Redis-клиент."""
     return Redis(connection_pool=get_redis_pool())
 
 
@@ -33,4 +36,4 @@ async def close_redis() -> None:
     if _pool:
         await _pool.aclose()
         _pool = None
-        logger.info("Redis connection pool closed")
+        logger.info("Redis-пул закрыт")

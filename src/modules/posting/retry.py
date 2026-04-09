@@ -1,7 +1,7 @@
-"""Retry constants for bot posting operations.
+"""Константы ретраев для постинга через ботов.
 
-Used by PostingService for exponential backoff when switching bots.
+Используется PostingService для экспоненциального backoff при смене бота.
 """
 
 MAX_RETRIES = 3
-BACKOFF_SECONDS = [1, 2, 4]  # exponential backoff: 1s, 2s, 4s
+BACKOFF_SECONDS = [1, 2, 4]  # экспоненциальный backoff: 1с, 2с, 4с

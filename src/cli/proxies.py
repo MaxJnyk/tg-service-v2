@@ -1,7 +1,7 @@
 """
-CLI for proxy management.
+CLI для управления прокси.
 
-Usage:
+Использование:
   python -m src.cli.proxies add --host 1.2.3.4 --port 1080 --protocol socks5
   python -m src.cli.proxies import --file proxies.txt
   python -m src.cli.proxies list
@@ -9,11 +9,26 @@ Usage:
 """
 
 import asyncio
+import getpass
+import logging
 from pathlib import Path
 
 import typer
 
-app = typer.Typer(help="Proxy management")
+_audit_logger = logging.getLogger("tg-service.audit.cli")
+_audit_logger.setLevel(logging.INFO)
+if not _audit_logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(asctime)s AUDIT %(message)s"))
+    _audit_logger.addHandler(_h)
+
+
+def _audit(action: str, details: str = "") -> None:
+    user = getpass.getuser()
+    _audit_logger.info("user=%s action=%s %s", user, action, details)
+
+
+app = typer.Typer(help="Управление прокси")
 
 
 @app.command("add")
@@ -25,14 +40,16 @@ def add_proxy(
     password: str | None = typer.Option(None, help="Auth password"),
     country: str | None = typer.Option(None, help="Country code (US, DE, etc.)"),
 ) -> None:
-    """Add a single proxy."""
+    """Добавить один прокси."""
+    _audit("add_proxy", f"host={host} port={port} protocol={protocol}")
+
     async def _add() -> None:
         from src.modules.accounts.service import AccountService
         proxy_id = await AccountService.add_proxy(
             host=host, port=port, protocol=protocol,
             username=username, password=password, country_code=country,
         )
-        typer.echo(f"Added proxy {host}:{port} (id={proxy_id})")
+        typer.echo(f"Добавлен прокси {host}:{port} (id={proxy_id})")
 
     asyncio.run(_add())
 
@@ -41,18 +58,19 @@ def add_proxy(
 def import_proxies(
     file: Path = typer.Option(..., help="Text file with proxies, one per line: protocol://user:pass@host:port"),
 ) -> None:
-    """Import proxies from a text file.
+    """Импорт прокси из текстового файла.
 
-    Supported formats:
+    Поддерживаемые форматы:
       socks5://user:pass@1.2.3.4:1080
       http://1.2.3.4:8080
-      1.2.3.4:1080  (defaults to socks5)
+      1.2.3.4:1080  (по умолчанию socks5)
     """
     if not file.exists():
-        typer.echo(f"File not found: {file}")
+        typer.echo(f"Файл не найден: {file}")
         raise typer.Exit(1)
 
     lines = file.read_text().strip().splitlines()
+    _audit("import_proxies", f"file={file} lines={len(lines)}")
 
     async def _import() -> None:
         from src.modules.accounts.service import AccountService
@@ -66,23 +84,25 @@ def import_proxies(
                 await AccountService.add_proxy(**parsed)
                 count += 1
             except Exception as exc:
-                typer.echo(f"  ⚠️ Skipped: {line} ({exc})")
-        typer.echo(f"Imported {count} proxies")
+                typer.echo(f"   Skipped: {line} ({exc})")
+        typer.echo(f"Импортировано {count} прокси")
 
     asyncio.run(_import())
 
 
 @app.command("list")
 def list_proxies() -> None:
-    """List all proxies."""
+    """Список всех прокси."""
+    _audit("list_proxies")
+
     async def _list() -> None:
         from src.modules.accounts.service import AccountService
         proxies = await AccountService.list_proxies()
         if not proxies:
-            typer.echo("No proxies configured")
+            typer.echo("Нет настроенных прокси")
             return
         for p in proxies:
-            status = "✅" if p["is_active"] else "❌"
+            status = "ОК" if p["is_active"] else "НЕ ОК)"
             latency = f"{p['response_time_ms']}ms" if p["response_time_ms"] else "?"
             typer.echo(f"  {status} {p['protocol']}://{p['host']}:{p['port']} [{latency}] {p['country_code'] or ''}")
 
@@ -91,7 +111,9 @@ def list_proxies() -> None:
 
 @app.command("check")
 def check_proxies() -> None:
-    """Health check all proxies."""
+    """Health check всех прокси."""
+    _audit("check_proxies")
+
     async def _check() -> None:
         from src.modules.scraping.proxy_manager import ProxyManager
         result = await ProxyManager.check_all_proxies()
@@ -101,7 +123,7 @@ def check_proxies() -> None:
 
 
 def _parse_proxy_line(line: str) -> dict:
-    """Parse proxy line: protocol://user:pass@host:port"""
+    """Распарсить строку прокси: protocol://user:pass@host:port"""
     protocol = "socks5"
     username = None
     password = None

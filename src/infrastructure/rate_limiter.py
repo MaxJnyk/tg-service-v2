@@ -1,12 +1,9 @@
 """
-Redis-backed rate limiter for Telegram Bot API.
+Redis-бейсд rate limiter для Telegram Bot API.
 
-Telegram limits:
-  - Global: 30 messages/second across all chats
-  - Per-chat: 1 message/second (Telegram silently drops/delays otherwise)
-
-Uses atomic Lua script for check-and-acquire in a single round-trip.
-All workers share the same Redis → cluster-safe.
+Двухуровневое скользящее окно: глобально (30 msg/sec) + по чату (20 msg/min).
+Атомарный Lua-скрипт для check-and-acquire — нет race condition.
+Безопасно для кластера: один Redis-ключ на операцию.
 """
 
 import asyncio
@@ -18,12 +15,12 @@ from redis.asyncio import Redis
 logger = logging.getLogger(__name__)
 
 # Telegram Bot API hard limits
-_GLOBAL_LIMIT = 25          # msg/sec, conservative (hard limit is 30)
+_GLOBAL_LIMIT = 25          # msg/sec, консервативный (hard limit is 30)
 _PER_CHAT_LIMIT = 1         # msg/sec per chat
 _WINDOW_SEC = 1.0
 _MAX_WAIT_SEC = 10.0        # give up after 10s waiting for slot
 
-# Lua script: atomic check-and-acquire (no race condition between check and add)
+# Lua-скрипт: атомарный "check and acquire" для скользящего окна.
 _ACQUIRE_LUA = """
 local global_key = KEYS[1]
 local chat_key   = KEYS[2]
@@ -56,9 +53,9 @@ return 1
 
 class RateLimiter:
     """
-    Two-level sliding-window rate limiter backed by Redis.
+    Двухуровневый rate limiter с скользящим окном, основанный на Redis.
 
-    Uses a single Lua script for atomic check+acquire — safe under concurrency.
+    Использует атомарный Lua-скрипт для check+acquire — безопасно при конкурентном доступе.
 
     Usage:
         await rate_limiter.acquire(chat_id="@channel")
@@ -70,12 +67,7 @@ class RateLimiter:
         self._script = redis.register_script(_ACQUIRE_LUA)
 
     async def acquire(self, chat_id: str) -> None:
-        """
-        Block until both global and per-chat slots are available.
-
-        Raises:
-            asyncio.TimeoutError: if waited more than _MAX_WAIT_SEC
-        """
+        """Занять слот. Блокирует пока не освободится место (MAX_WAIT)."""
         deadline = time.monotonic() + _MAX_WAIT_SEC
         while True:
             now = time.time()
@@ -91,14 +83,9 @@ class RateLimiter:
             await asyncio.sleep(0.05)  # 50ms polling
 
     async def _try_acquire(self, now: float, chat_id: str) -> bool:
-        """
-        Atomically check and record a slot via Lua script.
-        Single Redis round-trip — no race condition.
-        """
         global_key = "tg_rl:global"
         chat_key = f"tg_rl:chat:{chat_id}"
         window_start = now - _WINDOW_SEC
-        # Unique member: timestamp + chat_id to avoid collisions in sorted set
         member = f"{now}:{chat_id}"
 
         result = await self._script(

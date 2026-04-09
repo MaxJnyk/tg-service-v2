@@ -1,10 +1,13 @@
 """
-Service-level exceptions.
+Исключения уровня сервиса.
+
+Все ошибки наследуются от TelegramServiceError и содержат error_code,
+который отправляется в Kafka result (см. core/error_codes.py).
 """
 
 
 class TelegramServiceError(Exception):
-    """Base exception for all service errors."""
+    """Базовое исключение для всех ошибок сервиса."""
 
     def __init__(self, message: str, error_code: str = "INTERNAL_ERROR") -> None:
         self.error_code = error_code
@@ -12,29 +15,29 @@ class TelegramServiceError(Exception):
 
 
 class BotError(TelegramServiceError):
-    """Bot operation failed."""
+    """Ошибка операции через бота (aiogram)."""
     pass
 
 
 class SessionError(TelegramServiceError):
-    """Telethon session operation failed."""
+    """Ошибка операции через юзербот (Telethon)."""
     pass
 
 
 class ProxyError(TelegramServiceError):
-    """Proxy connection failed."""
+    """Ошибка подключения через прокси."""
     pass
 
 
 class NoAvailableBotError(TelegramServiceError):
-    """No active bot available for the operation."""
+    """Нет активного бота для выполнения операции."""
 
     def __init__(self, message: str = "No active bot available") -> None:
         super().__init__(message, error_code="NO_ACTIVE_BOT")
 
 
 class NoAvailableSessionError(TelegramServiceError):
-    """No active Telethon session available."""
+    """Нет активной Telethon-сессии."""
 
     def __init__(self, message: str = "No active session available") -> None:
         super().__init__(message, error_code="NO_ACTIVE_SESSION")

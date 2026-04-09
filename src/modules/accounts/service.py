@@ -1,6 +1,8 @@
 """
-Account service — high-level operations for bot/session/proxy management.
-Used by CLI and internally by posting/scraping modules.
+Сервис аккаунтов — высокоуровневые операции с ботами, сессиями и прокси.
+
+Используется CLI-командами и внутренне модулями постинга/парсинга.
+Все секреты шифруются перед записью в БД (Fernet).
 """
 
 import logging
@@ -71,6 +73,7 @@ class AccountService:
         role: str = "scrape",
     ) -> str:
         encrypted_session = encrypt(session_string)
+        encrypted_api_hash = encrypt(api_hash)
         async with async_session_factory() as db:
             repo = AccountRepository(db)
             existing = await repo.get_session_by_phone(phone)
@@ -82,7 +85,7 @@ class AccountService:
                 phone=phone,
                 session_string=encrypted_session,
                 api_id=api_id,
-                api_hash=api_hash,
+                api_hash=encrypted_api_hash,
                 device_info=device_info or {},
                 proxy_id=proxy_id,
                 role=role,
@@ -119,6 +122,7 @@ class AccountService:
         password: str | None = None,
         country_code: str | None = None,
     ) -> str:
+        encrypted_password = encrypt(password) if password else None
         async with async_session_factory() as db:
             repo = AccountRepository(db)
             proxy = await repo.create_proxy(
@@ -126,7 +130,7 @@ class AccountService:
                 port=port,
                 protocol=protocol,
                 username=username,
-                password=password,
+                password=encrypted_password,
                 country_code=country_code,
             )
             await db.commit()

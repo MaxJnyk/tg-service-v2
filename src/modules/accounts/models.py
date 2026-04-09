@@ -1,11 +1,13 @@
 """
-Own database models for accounts management.
-Independent from accounting-service — no external dependencies.
+SQLAlchemy-модели для  БД сервиса.
 
-Tables:
-  - bot_accounts: Bot tokens for posting via aiogram
-  - telegram_sessions: Telethon sessions for scraping/manage
-  - proxies: SOCKS5/HTTP proxies for anonymity
+Три таблицы:
+  - bot_accounts — Telegram-боты для постинга
+  - proxies — SOCKS5/HTTP прокси
+  - telegram_sessions — Telethon-сессии для парсинга
+
+Все секретные поля (bot_token, session_string, api_hash, proxy password)
+хранятся зашифрованными через Fernet.
 """
 
 from datetime import datetime
@@ -22,9 +24,9 @@ class BotAccount(Base):
     __tablename__ = "bot_accounts"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=lambda: str(uuid4()))
-    bot_token: Mapped[str] = mapped_column(String, nullable=False)  # encrypted with Fernet
+    bot_token: Mapped[str] = mapped_column(String, nullable=False)    # Зашифрован через Fernet
     name: Mapped[str] = mapped_column(String, nullable=False)  # @botname
-    platform_id: Mapped[str | None] = mapped_column(UUID(as_uuid=False), nullable=True)  # linked platform
+    platform_id: Mapped[str | None] = mapped_column(UUID(as_uuid=False), nullable=True)  # связанная платформа
     is_active: Mapped[bool] = mapped_column(default=True)
     fail_count: Mapped[int] = mapped_column(default=0)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -42,7 +44,7 @@ class Proxy(Base):
     port: Mapped[int] = mapped_column(nullable=False)
     protocol: Mapped[str] = mapped_column(String, default="socks5")  # socks5 / http
     username: Mapped[str | None] = mapped_column(String, nullable=True)
-    password: Mapped[str | None] = mapped_column(String, nullable=True)
+    password: Mapped[str | None] = mapped_column(String, nullable=True)    # Зашифрован через Fernet
     country_code: Mapped[str | None] = mapped_column(String(2), nullable=True)  # US, DE, etc.
     is_active: Mapped[bool] = mapped_column(default=True)
     response_time_ms: Mapped[int | None] = mapped_column(nullable=True)
@@ -59,9 +61,9 @@ class TelegramSession(Base):
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=False), primary_key=True, default=lambda: str(uuid4()))
     phone: Mapped[str] = mapped_column(String, unique=True, nullable=False)
-    session_string: Mapped[str] = mapped_column(String, nullable=False)  # encrypted with Fernet
+    session_string: Mapped[str] = mapped_column(String, nullable=False)    # Зашифрован через Fernet
     api_id: Mapped[int] = mapped_column(nullable=False)
-    api_hash: Mapped[str] = mapped_column(String, nullable=False)
+    api_hash: Mapped[str] = mapped_column(String, nullable=False)    # Зашифрован через Fernet
     device_info: Mapped[dict] = mapped_column(JSON, default=dict)  # device fingerprint
     proxy_id: Mapped[str | None] = mapped_column(
         UUID(as_uuid=False), ForeignKey("proxies.id"), nullable=True

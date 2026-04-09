@@ -1,17 +1,17 @@
 """
-tg-service-v2 entry point.
+Точка входа tg-service-v2.
 
-Lifecycle:
-  1. Start Kafka producer
-  2. Register handlers on TopicRouter
-  3. Start Kafka consumer
-  4. Run consume loop
-  5. On SIGTERM/SIGINT → graceful shutdown:
-     a. Stop consumer (stop receiving new messages)
-     b. Wait for current task to finish (SHUTDOWN_TIMEOUT)
-     c. Close bot pool connections
-     d. Stop producer
-     e. Close DB + Redis connections
+Жизненный цикл:
+  1. Запускаем Kafka producer
+  2. Регистрируем обработчики в TopicRouter
+  3. Запускаем Kafka consumer
+  4. Крутим consume loop
+  5. По SIGTERM/SIGINT → graceful shutdown:
+     a. Стоп consumer (не принимаем новых сообщений)
+     b. Ждём завершения текущих задач (SHUTDOWN_TIMEOUT)
+     c. Закрываем пулы Telegram-клиентов
+     d. Стоп producer
+     e. Закрываем БД + Redis
 """
 
 import asyncio
@@ -43,21 +43,21 @@ setup_logging()
 logger = logging.getLogger("tg-service-v2")
 
 
-# Global instances
+# Глобальные пулы (создаются один раз, закрываются при shutdown)
 bot_pool = BotPool(max_size=settings.BOT_POOL_MAX_SIZE)
 session_pool = SessionPool(max_size=settings.SESSION_POOL_MAX_SIZE)
 
 
 def _register_handlers(router: TopicRouter) -> None:
-    """Register topic handlers. Add new handlers here as modules are built."""
-    # Posting handlers (Day 4)
+    """Регистрация обработчиков. Новые модули добавлять сюда."""
+    # Обработчики постинга (send/edit/delete через бота)
     rate_limiter = RateLimiter(get_redis())
     posting_service = PostingService(bot_pool, rate_limiter=rate_limiter)
     posting_handlers = create_posting_handlers(posting_service)
     for topic, handler in posting_handlers.items():
         router.register(topic, handler)
 
-    # Scraping handlers (Day 5-7)
+    # Обработчики парсинга (сбор статистики каналов через Telethon)
     scraping_service = ScrapingService(session_pool)
     scraping_handlers = create_scraping_handlers(scraping_service)
     for topic, handler in scraping_handlers.items():
@@ -71,7 +71,7 @@ async def _shutdown(
     producer: KafkaResultProducer,
     main_task: asyncio.Task,
 ) -> None:
-    """Graceful shutdown — 5 steps."""
+    """Graceful shutdown — 5 шагов завершения."""
     logger.info("SHUTDOWN [1/5] Stopping consumer (no new messages)...")
     await consumer.stop()
 
@@ -98,7 +98,7 @@ async def _shutdown(
 
 
 async def main() -> None:
-    # Sentry error tracking (disabled if SENTRY_DSN is empty)
+    # Sentry для трекинга ошибок (выключен если SENTRY_DSN пустой)
     if settings.SENTRY_DSN:
         sentry_sdk.init(
             dsn=settings.SENTRY_DSN,
@@ -106,13 +106,13 @@ async def main() -> None:
             environment="production",
             release="tg-service-v2@0.1.0",
         )
-        logger.info("Sentry initialized")
+        logger.info("Инициализирован Sentry")
 
-    # Prometheus metrics server
-    start_http_server(settings.METRICS_PORT)
-    logger.info("Prometheus metrics on port %d", settings.METRICS_PORT)
+    # Prometheus-метрики — только localhost (скрейпится изнутри сети)
+    start_http_server(settings.METRICS_PORT, addr="127.0.0.1")
+    logger.info("Prometheus metrics on 127.0.0.1:%d", settings.METRICS_PORT)
 
-    # Transport layer
+    # Транспортный слой
     producer = KafkaResultProducer(settings.KAFKA_BOOTSTRAP_SERVERS)
     await producer.start()
 
@@ -128,11 +128,11 @@ async def main() -> None:
     )
     await consumer.start()
 
-    # Healthcheck server (readiness probe) on METRICS_PORT + 1
+    # Healthcheck-сервер (readiness probe) на METRICS_PORT + 1
     healthcheck_mod._consumer_ref = consumer
     _health_server = await start_healthcheck_server(settings.METRICS_PORT + 1)
 
-    # Signal handlers for graceful shutdown
+    # Обработчики сигналов для graceful shutdown
     loop = asyncio.get_running_loop()
     main_task = asyncio.current_task()
     shutdown = lambda: asyncio.create_task(_shutdown(consumer, producer, main_task))  # noqa: E731
@@ -142,7 +142,7 @@ async def main() -> None:
     # Mark service as healthy
     service_up.set(1)
 
-    # Main loop
+    # Основной цикл обработки Kafka-сообщений
     logger.info("tg-service-v2 is running. Waiting for Kafka messages...")
     try:
         await consumer.consume_loop()

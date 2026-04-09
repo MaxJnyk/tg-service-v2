@@ -1,5 +1,7 @@
 """
-Topic router — dispatches Kafka messages to registered handlers.
+Роутер топиков — направляет Kafka-сообщения в зарегистрированные обработчики.
+
+Если обработчик не найден — логируем warning и отправляем error result.
 """
 
 import logging
@@ -24,7 +26,7 @@ class TopicRouter:
 
     def register(self, topic: str, handler: Handler) -> None:
         self._handlers[topic] = handler
-        logger.info("Registered handler for topic: %s", topic)
+        logger.info("Зарегистрирован обработчик для топика: %s", topic)
 
     async def dispatch(
         self,
@@ -32,6 +34,7 @@ class TopicRouter:
         request: TaskRequestSchema,
         producer: KafkaResultProducer,
     ) -> None:
+        """Отправить сообщение нужному обработчику. False если обработчика нет."""
         handler = self._handlers.get(topic)
         if handler is None:
             logger.warning("No handler for topic %s, request_id=%s", topic, request.request_id)

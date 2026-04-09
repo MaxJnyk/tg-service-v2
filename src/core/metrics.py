@@ -1,10 +1,12 @@
 """
-Prometheus metrics for monitoring.
+Prometheus-метрики для мониторинга.
+
+Скрейпятся Prometheus на METRICS_PORT (127.0.0.1, доступ только изнутри сети).
 """
 
 from prometheus_client import Counter, Gauge, Histogram
 
-# Kafka
+# Kafka — счётчики обработки сообщений
 kafka_messages_received = Counter(
     "tg_service_kafka_messages_received_total",
     "Total Kafka messages received",
@@ -27,19 +29,19 @@ kafka_processing_duration = Histogram(
     buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0],
 )
 
-# Bot pool
+# Пул ботов
 active_bots = Gauge(
     "tg_service_active_bots",
     "Number of active bot instances in pool",
 )
 
-# Session pool
+# Пул сессий (Telethon)
 active_sessions = Gauge(
     "tg_service_active_sessions",
     "Number of active Telethon sessions in pool",
 )
 
-# Posting
+# Постинг
 posting_operations = Counter(
     "tg_service_posting_operations_total",
     "Total posting operations",

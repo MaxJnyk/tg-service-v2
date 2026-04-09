@@ -1,14 +1,14 @@
 """
-Kafka handlers for posting topics:
+Kafka-обработчики постинга:
   - send_bot_message
   - edit_bot_message
   - delete_bot_message
 
-Each handler:
-  1. Checks idempotency (all operations — prevents Kafka redelivery issues)
-  2. Parses payload from TaskRequestSchema
-  3. Calls PostingService
-  4. Sends result back via KafkaResultProducer
+Каждый handler:
+  1. Проверяет идемпотентность (защита от повторной доставки Kafka)
+  2. Парсит payload из TaskRequestSchema
+  3. Вызывает PostingService
+  4. Отправляет результат через KafkaResultProducer
 """
 
 import logging
@@ -21,11 +21,23 @@ from src.transport.schemas import TaskRequestSchema
 
 logger = logging.getLogger(__name__)
 
-_IDEMPOTENCY_TTL = 86400  # 24h
+_IDEMPOTENCY_TTL = 86400  # 24 часа — TTL ключа идемпотентности
+_MAX_MESSAGE_ID = 2**53  # Telegram использует int53 для message_id
+
+
+def _validate_message_id(raw: str | int) -> int | None:
+    """Провалидировать и преобразовать message_id. None если невалидный."""
+    try:
+        mid = int(raw)
+    except (ValueError, TypeError):
+        return None
+    if mid <= 0 or mid > _MAX_MESSAGE_ID:
+        return None
+    return mid
 
 
 async def _check_idempotency(request_id: str) -> bool:
-    """Return True if this request_id was already processed (duplicate)."""
+    """True если request_id уже обработан (дубль)."""
     key = f"tg_idem:post:{request_id}"
     redis = get_redis()
     result = await redis.set(key, "1", nx=True, ex=_IDEMPOTENCY_TTL)
@@ -38,7 +50,7 @@ async def _send_error(
     producer: KafkaResultProducer,
     exc: TelegramServiceError,
 ) -> None:
-    """Send error result — shared by all posting handlers."""
+    """Отправить результат с ошибкой — общий метод для всех handlerов."""
     logger.error("%s failed: %s (code=%s)", topic, exc, exc.error_code)
     await producer.send_result(
         original_topic=topic,
@@ -48,14 +60,14 @@ async def _send_error(
 
 
 def _parse_platform_and_chat(payload: dict) -> tuple[dict, str | int]:
-    """Extract platform dict and resolved chat_id from handler payload."""
+    """Извлечь platform и распознанный chat_id из payload."""
     platform = payload.get("platform", {})
     raw_chat = platform.get("internal_id") or platform.get("url", "")
     return platform, PostingService.resolve_chat_id(raw_chat)
 
 
 def create_posting_handlers(posting_service: PostingService) -> dict:
-    """Create handler functions that close over the posting service."""
+    """Создать handler-функции, замыкающие posting service."""
 
     async def handle_send_bot_message(
         request: TaskRequestSchema,
@@ -99,18 +111,19 @@ def create_posting_handlers(posting_service: PostingService) -> dict:
         message = payload.get("message", {})
         message_id = payload.get("message_id") or message.get("message_id")
 
-        if not message_id:
+        validated_mid = _validate_message_id(message_id) if message_id else None
+        if validated_mid is None:
             await producer.send_result(
                 original_topic="edit_bot_message",
                 request=request,
-                error="[INVALID_PAYLOAD] message_id is required",
+                error="[INVALID_PAYLOAD] message_id is required or invalid",
             )
             return
 
         try:
             result = await posting_service.edit_message(
                 chat_id=chat_id,
-                message_id=int(message_id),
+                message_id=validated_mid,
                 text=message.get("text", ""),
                 platform_id=str(platform.get("id", "")),
                 media=message.get("media"),
@@ -138,18 +151,19 @@ def create_posting_handlers(posting_service: PostingService) -> dict:
         message = payload.get("message", {})
         message_id = message.get("message_id")
 
-        if not message_id:
+        validated_mid = _validate_message_id(message_id) if message_id else None
+        if validated_mid is None:
             await producer.send_result(
                 original_topic="delete_bot_message",
                 request=request,
-                error="[INVALID_PAYLOAD] message_id is required",
+                error="[INVALID_PAYLOAD] message_id is required or invalid",
             )
             return
 
         try:
             result = await posting_service.delete_message(
                 chat_id=chat_id,
-                message_id=int(message_id),
+                message_id=validated_mid,
                 platform_id=str(platform.get("id", "")),
             )
             await producer.send_result(

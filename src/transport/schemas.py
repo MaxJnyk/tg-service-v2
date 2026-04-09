@@ -1,22 +1,21 @@
 """
-Kafka message schemas — compatible with tad-backend's tg_messenger_client.
+Pydantic-схемы для Kafka-сообщений.
 
-These are intentional copies of:
-  tad-backend/app/src/tg_messenger_client/tg_messenger_client/schemas.py
-
-We maintain our own copy to avoid git submodule dependency.
-Schema compatibility is validated by integration tests.
+Должны быть совместимы с tad-backend (TaskRequestSchema, TaskResultSchema).
+Ничего тут не менять без согласования с бекендом БЛЕАТЬ!!!
 """
 
 import re
 from typing import Any
 from uuid import UUID
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, field_validator, model_validator
+
+_RESULT_TOPIC_RE = re.compile(r"^tad_[a-z_]+_result$")
 
 
 def _is_invite_url(url: str) -> str | None:
-    """Extract invite hash from Telegram invite URL."""
+    """Проверить, является ли URL invite-ссылкой. Вернуть hash или None."""
     if not url:
         return None
     match = re.search(r"(?:\+|joinchat/)([A-Za-z0-9_-]+)$", url)
@@ -26,6 +25,12 @@ def _is_invite_url(url: str) -> str | None:
 
 
 class PlatformSchema(BaseModel):
+    """Площадка из payload tad-backend (парсинг, постинг).
+
+    Вспомогательные свойства:
+      .username: извлекает из url (например, "t.me/channel" → "channel")
+      .invite_hash: извлекает из invite-ссылки (например, "+ABcDeF123")
+    """
     id: UUID | None = None
     url: str | None = None
     invite_link: str | None = None
@@ -64,13 +69,22 @@ class PayloadSchema(BaseModel):
 
 
 class TaskRequestSchema(BaseModel):
+    """Входящая задача от tad-backend через Kafka."""
     request_id: str | UUID
     callback_task_name: str | None = None
     result_topic: str | None = None
     payload: Any | None = None
 
+    @field_validator("result_topic")
+    @classmethod
+    def validate_result_topic(cls, v: str | None) -> str | None:
+        if v is not None and not _RESULT_TOPIC_RE.match(v):
+            raise ValueError(f"result_topic must match tad_*_result pattern, got: {v!r}")
+        return v
+
 
 class TaskResultSchema(BaseModel):
+    """Результат, отправляемый обратно в tad-backend через Kafka."""
     request_id: str | UUID
     callback_task_name: str | None = None
     request_payload: Any | None = None

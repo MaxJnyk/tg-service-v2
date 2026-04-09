@@ -10,8 +10,25 @@ push: build
 	docker push $(IMAGE):$(TAG)
 
 deploy:
-	docker compose -f docker-compose.production.yml pull
-	docker compose -f docker-compose.production.yml up -d
+	TAG=$(TAG) docker compose -f docker-compose.production.yml pull
+	TAG=$(TAG) docker compose -f docker-compose.production.yml up -d
+
+deploy-specific:
+	@echo "Deploying version: $(TAG)"
+	docker compose -f docker-compose.production.yml pull tg-service
+	docker compose -f docker-compose.production.yml up -d tg-service
+
+# Rollback to previous version
+rollback:
+	docker compose -f docker-compose.production.yml stop tg-service
+	docker compose -f docker-compose.production.yml rm -f tg-service
+	docker compose -f docker-compose.production.yml up -d tg-service
+
+# Initial setup on new server
+setup:
+	@echo "Creating external network tad-network..."
+	docker network create tad-network 2>/dev/null || true
+	@echo "Setup complete. Copy .env.production to .env and configure."
 
 migrate:
 	docker compose -f docker-compose.production.yml exec tg-service alembic upgrade head

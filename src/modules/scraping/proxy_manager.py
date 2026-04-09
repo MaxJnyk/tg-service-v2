@@ -1,5 +1,5 @@
 """
-Proxy manager — health check and rotation for SOCKS5/HTTP proxies.
+Менеджер прокси — health check и ротация SOCKS5/HTTP прокси.
 """
 
 import asyncio
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class ProxyManager:
     @staticmethod
     async def check_proxy(proxy: Proxy) -> bool:
-        """Check if proxy is alive by connecting to Telegram's DC."""
+        """Проверить живость прокси подключением к Telegram DC."""
         try:
             start = asyncio.get_event_loop().time()
             reader, writer = await asyncio.wait_for(
@@ -59,7 +59,7 @@ class ProxyManager:
 
     @staticmethod
     async def check_all_proxies() -> str:
-        """Check all proxies. Returns summary."""
+        """Проверить все прокси. Возвращает summary."""
         async with async_session_factory() as db:
             result = await db.execute(select(Proxy))
             proxies = list(result.scalars().all())
@@ -76,7 +76,7 @@ class ProxyManager:
 
     @staticmethod
     async def get_active_proxy() -> Proxy | None:
-        """Get the fastest active proxy."""
+        """Получить самый быстрый активный прокси."""
         async with async_session_factory() as db:
             result = await db.execute(
                 select(Proxy)

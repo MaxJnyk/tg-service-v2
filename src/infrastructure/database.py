@@ -1,5 +1,8 @@
 """
-Async SQLAlchemy engine and session factory.
+Async SQLAlchemy движок и фабрика сессий.
+
+Используем asyncpg как драйвер. Пул коннектов настраивается
+через pool_size/max_overflow. pool_pre_ping защищает от мёртвых коннектов.
 """
 
 from collections.abc import AsyncGenerator
@@ -11,9 +14,9 @@ from src.config import settings
 
 engine = create_async_engine(
     settings.DATABASE_URL,
-    echo=False,
-    pool_size=20,
-    max_overflow=20,
+    echo=False,  # True для логирования всех SQL-запросов (очень шумно!)
+    pool_size=30,
+    max_overflow=30,
     pool_pre_ping=True,
     pool_recycle=3600,
 )

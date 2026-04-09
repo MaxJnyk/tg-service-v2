@@ -1,5 +1,8 @@
 """
-Session pool — manages Telethon client lifecycle with round-robin selection.
+Пул сессий — управляет жизненным циклом Telethon-клиентов с round-robin выбором.
+
+Поддерживает busy-трекинг, FloodWait кулдаун, авто-деактивацию после 5 фейлов,
+и anti-detect jitter перед каждым запросом.
 """
 
 import asyncio
@@ -11,13 +14,14 @@ from sqlalchemy import select, update
 from telethon import TelegramClient
 
 from src.core.exceptions import NoAvailableSessionError
+from src.core.security import mask_phone
 from src.infrastructure.database import async_session_factory
 from src.modules.accounts.models import Proxy, TelegramSession
 from src.modules.scraping.telethon_client import create_telethon_client
 
 logger = logging.getLogger(__name__)
 
-# Anti-detect: random delay before each Telegram request
+# Anti-detect: случайная задержка перед каждым запросом в Telegram
 _JITTER_MIN = 0.5
 _JITTER_MAX = 2.5
 
@@ -27,11 +31,11 @@ class SessionPool:
         self._pool: dict[str, TelegramClient] = {}  # session_id -> client
         self._max_size = max_size
         self._round_robin_index = 0
-        self._lock = asyncio.Lock()  # Guards pool dict mutations + round-robin
-        self._busy: set[str] = set()  # session_ids currently in use
+        self._lock = asyncio.Lock()  # Защищает мутации пула + round-robin
+        self._busy: set[str] = set()  # session_id сессий, занятых сейчас
 
     async def get_session(self, role: str = "scrape", _retry_depth: int = 0) -> tuple[TelegramClient, TelegramSession]:
-        """Get an active session for the given role. Creates client if not in pool."""
+        """Получить активную сессию для роли. Создаёт клиент если его нет в пуле."""
         async with async_session_factory() as db:
             result = await db.execute(
                 select(TelegramSession)
@@ -48,7 +52,7 @@ class SessionPool:
             if not sessions:
                 raise NoAvailableSessionError(f"No active sessions with role={role}")
 
-            # Round-robin, skip sessions currently in use by another task
+            # Round-robin, пропускаем сессии занятые другими задачами
             async with self._lock:
                 session = None
                 for i in range(len(sessions)):
@@ -60,14 +64,14 @@ class SessionPool:
                         self._busy.add(session.id)
                         break
                 if session is None:
-                    # All sessions busy — fall back to round-robin (allow sharing)
+                    # Все сессии заняты — разрешаем шаринг через round-robin
                     idx = self._round_robin_index % len(sessions)
                     self._round_robin_index += 1
                     session = sessions[idx]
                     self._busy.add(session.id)
 
-            # Load proxy — sticky binding: each session MUST use its assigned proxy.
-            # Telegram tracks IP changes; connecting without proxy exposes server IP.
+            # Прокси — строгая привязка: каждая сессия ОБЯЗАНА использовать свою прокси.
+            # Telegram трекает смену IP; без прокси светится IP сервера.
             proxy = None
             if session.proxy_id:
                 proxy_result = await db.execute(
@@ -77,21 +81,21 @@ class SessionPool:
                 if proxy is None:
                     logger.warning(
                         "Session %s has proxy_id=%s but proxy is inactive/missing — skipping to avoid IP leak",
-                        session.phone, session.proxy_id,
+                        mask_phone(session.phone), session.proxy_id,
                     )
-                    # Skip this session, try next one via round-robin (with depth guard)
+                    # Пропускаем эту сессию, берём следующую (с защитой от рекурсии)
                     if _retry_depth >= 10:
                         raise NoAvailableSessionError("All sessions have dead proxies")
                     return await self.get_session(role=role, _retry_depth=_retry_depth + 1)
 
             elif session.proxy_id is None:
-                logger.warning("Session %s has NO proxy assigned — connecting with server IP", session.phone)
+                logger.warning("Session %s has NO proxy assigned — connecting with server IP", mask_phone(session.phone))
 
-        # Get or create client; reconnect if connection dropped
+        # Получить или создать клиент; переподключиться если коннект упал
         async with self._lock:
             existing = self._pool.get(session.id)
             if existing is not None and not existing.is_connected():
-                logger.warning("Session %s lost connection, reconnecting", session.phone)
+                logger.warning("Session %s lost connection, reconnecting", mask_phone(session.phone))
                 try:
                     await existing.disconnect()
                 except Exception:
@@ -103,25 +107,25 @@ class SessionPool:
                 client = create_telethon_client(session, proxy)
                 await client.connect()
                 if not await client.is_user_authorized():
-                    logger.error("Session %s not authorized, marking as archived", session.phone)
+                    logger.error("Session %s not authorized, marking as archived", mask_phone(session.phone))
                     await self._mark_session_status(session.id, "archived")
                     raise NoAvailableSessionError(f"Session {session.phone} not authorized")
                 self._pool[session.id] = client
-                logger.info("Connected session %s (pool size: %d)", session.phone, len(self._pool))
+                logger.info("Connected session %s (pool size: %d)", mask_phone(session.phone), len(self._pool))
 
-        # Anti-detect jitter after connection (before actual Telegram API call)
+        # Anti-detect jitter после подключения (перед реальным API-вызовом)
         jitter = random.uniform(_JITTER_MIN, _JITTER_MAX)
         await asyncio.sleep(jitter)
 
         return self._pool[session.id], session
 
     async def release_session(self, session_id: str) -> None:
-        """Release a session back to the pool (no longer busy)."""
+        """Вернуть сессию в пул (больше не занята)."""
         async with self._lock:
             self._busy.discard(session_id)
 
     async def mark_flood_wait(self, session_id: str, wait_seconds: int) -> None:
-        """Mark session with flood wait cooldown."""
+        """Отметить сессию на FloodWait кулдаун."""
         until = datetime.now(UTC).replace(microsecond=0) + timedelta(seconds=wait_seconds)
         await self._mark_session_flood(session_id, until)
 
@@ -131,7 +135,7 @@ class SessionPool:
                 del self._pool[session_id]
 
     async def mark_session_failed(self, session_id: str) -> None:
-        """Increment fail count; deactivate after 5 failures."""
+        """Увеличить счётчик ошибок; деактивировать после 5 фейлов."""
         async with async_session_factory() as db:
             result = await db.execute(
                 select(TelegramSession).where(TelegramSession.id == session_id)
@@ -141,7 +145,7 @@ class SessionPool:
                 session.fail_count += 1
                 if session.fail_count >= 5:
                     session.status = "banned"
-                    logger.warning("Session %s marked as banned after %d failures", session.phone, session.fail_count)
+                    logger.warning("Session %s marked as banned after %d failures", mask_phone(session.phone), session.fail_count)
                     async with self._lock:
                         self._busy.discard(session_id)
                         if session_id in self._pool:
@@ -158,7 +162,7 @@ class SessionPool:
             await db.commit()
 
     async def close_all(self) -> None:
-        """Disconnect all Telethon clients."""
+        """Отключить все Telethon-клиенты (при shutdown)."""
         for sid, client in self._pool.items():
             try:
                 await client.disconnect()

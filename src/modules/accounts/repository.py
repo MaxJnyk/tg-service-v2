@@ -1,5 +1,5 @@
 """
-Repository for BotAccount, TelegramSession, Proxy CRUD operations.
+Репозиторий для CRUD-операций над BotAccount, TelegramSession, Proxy.
 """
 
 import logging

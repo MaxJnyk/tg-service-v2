@@ -1,11 +1,8 @@
 """
-Kafka result producer — sends TaskResultSchema to result topics.
+Kafka producer — отправляет TaskResultSchema обратно в result-топики.
 
-Result topic pattern: tad_{original_topic}_result
-This matches the regex in tad-backend's broker_async.py: tad_.*_result
-
-Uses orjson for serialization — 3-10x faster than stdlib json,
-native UUID/datetime support (no custom encoder needed).
+Использует orjson для быстрой сериализации. Имя result-топика
+строится как tad_{original_topic}_result.
 """
 
 import logging
@@ -35,7 +32,7 @@ class KafkaResultProducer:
     async def stop(self) -> None:
         if self._producer:
             await self._producer.stop()
-            logger.info("KafkaResultProducer stopped")
+            logger.info("KafkaResultProducer остановлен")
 
     def _make_result_topic(self, original_topic: str) -> str:
         """scrape_platform -> tad_scrape_platform_result"""

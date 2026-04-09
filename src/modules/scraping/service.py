@@ -1,12 +1,11 @@
 """
-Scraping service — scrapes Telegram channels via Telethon.
+Сервис парсинга — скрейпит Telegram-каналы через Telethon.
 
-Returns data in the **exact format** expected by tad-backend's
+Возвращает данные **точно** в формате tad-backend:
 ``tasks.parsing:save_parsing_results`` → ``ParsingResultPayload``.
 
-Fields: title, description, item_type, external_id, avatar,
-members_count, images_count, videos_count, links_count,
-reactions_count, forwards_count, replies_count,
+Поля: title, description, item_type, external_id, avatar,
+members_count, images/videos/links/reactions/forwards/replies_count,
 average_views_count_daily/weekly/monthly,
 average_messages_daily/weekly/monthly,
 median_views_daily/weekly/monthly,
@@ -34,11 +33,14 @@ from src.config import settings
 from src.core import error_codes
 from src.core.exceptions import SessionError
 from src.core.metrics import scraping_operations
+from src.core.security import mask_phone
 from src.modules.scraping.session_pool import SessionPool
+
+_TELETHON_TIMEOUT = 60  # таймаут на одну операцию парсинга
 
 logger = logging.getLogger(__name__)
 
-# Global semaphore: max 10 concurrent scraping operations (prevent mass FloodWait)
+# Глобальный семафор: макс 10 параллельных операций парсинга (защита от FloodWait)
 _SCRAPING_SEM = asyncio.Semaphore(10)
 
 _MAX_SCRAPE_RETRIES = 3
@@ -50,9 +52,9 @@ class ScrapingService:
         self._pool = session_pool
 
     async def scrape_platform(self, username: str, platform_id: str | None = None) -> dict[str, Any]:
-        """Scrape channel stats — compatible with tad-backend save_parsing_results.
+        """Спарсить статистику канала — совместимо с tad-backend save_parsing_results.
 
-        Retries up to 3 times with different sessions on FloodWait/failure.
+        До 3 попыток с разными сессиями при FloodWait/ошибке.
         """
         scraping_operations.inc()
 
@@ -62,13 +64,16 @@ class ScrapingService:
             for attempt in range(_MAX_SCRAPE_RETRIES):
                 client, session = await self._pool.get_session(role="scrape")
                 try:
-                    result = await self._do_scrape(client, session, username)
+                    result = await asyncio.wait_for(
+                        self._do_scrape(client, session, username),
+                        timeout=_TELETHON_TIMEOUT,
+                    )
                     await self._pool.mark_used(session.id)
                     await self._pool.release_session(session.id)
                     return result
 
                 except (UsernameNotOccupiedError, UsernameInvalidError, ChannelInvalidError, ValueError) as exc:
-                    # Channel doesn't exist or username invalid — session is fine, no point retrying
+                    # Канал не существует или username невалид — сессия в порядке, ретрай не нужен
                     await self._pool.mark_used(session.id)
                     await self._pool.release_session(session.id)
                     raise SessionError(
@@ -77,7 +82,7 @@ class ScrapingService:
                     ) from exc
 
                 except ChannelPrivateError as exc:
-                    # Private channel — session is fine, no point retrying
+                    # Приватный канал — сессия в порядке, ретрай не нужен
                     await self._pool.mark_used(session.id)
                     await self._pool.release_session(session.id)
                     raise SessionError(
@@ -89,7 +94,7 @@ class ScrapingService:
                     last_exc = exc
                     logger.warning(
                         "FloodWait %ds on session %s (attempt %d/%d), switching session",
-                        exc.seconds, session.phone, attempt + 1, _MAX_SCRAPE_RETRIES,
+                        exc.seconds, mask_phone(session.phone), attempt + 1, _MAX_SCRAPE_RETRIES,
                     )
                     await self._pool.mark_flood_wait(session.id, exc.seconds)
                     if attempt < _MAX_SCRAPE_RETRIES - 1:
@@ -100,7 +105,7 @@ class ScrapingService:
                     await self._pool.mark_session_failed(session.id)
                     logger.warning(
                         "Session %s banned (attempt %d/%d), switching session",
-                        session.phone, attempt + 1, _MAX_SCRAPE_RETRIES,
+                        mask_phone(session.phone), attempt + 1, _MAX_SCRAPE_RETRIES,
                     )
                     if attempt < _MAX_SCRAPE_RETRIES - 1:
                         await asyncio.sleep(_SCRAPE_BACKOFF[attempt])
@@ -110,20 +115,20 @@ class ScrapingService:
                     exc_str = str(exc)
                     await self._pool.mark_session_failed(session.id)
                     if "frozen" in exc_str.lower() or "ACCOUNT_FROZEN" in exc_str:
-                        # Frozen account — no point retrying, mark and raise immediately
-                        logger.warning("Session %s is frozen, marking as failed", session.phone)
+                        # Замороженный аккаунт — ретрай бесполезен, сразу ошибка
+                        logger.warning("Session %s is frozen, marking as failed", mask_phone(session.phone))
                         raise SessionError(
                             f"Account frozen: {exc}",
                             error_code=error_codes.SESSION_NOT_AVAILABLE,
                         ) from exc
                     logger.warning(
                         "Session %s error: %s (attempt %d/%d)",
-                        session.phone, exc, attempt + 1, _MAX_SCRAPE_RETRIES,
+                        mask_phone(session.phone), exc, attempt + 1, _MAX_SCRAPE_RETRIES,
                     )
                     if attempt < _MAX_SCRAPE_RETRIES - 1:
                         await asyncio.sleep(_SCRAPE_BACKOFF[attempt])
 
-            # All retries exhausted
+            # Все попытки исчерпаны
             if isinstance(last_exc, FloodWaitError):
                 raise SessionError(
                     f"FloodWait after {_MAX_SCRAPE_RETRIES} retries",
@@ -140,7 +145,7 @@ class ScrapingService:
             ) from last_exc
 
     async def _do_scrape(self, client: Any, session: Any, username: str) -> dict[str, Any]:
-        """Execute a single scrape attempt."""
+        """Выполнить одну попытку парсинга."""
         entity = await client.get_entity(username)
 
         full: ChatFull = await client(GetFullChannelRequest(entity))
@@ -170,7 +175,7 @@ class ScrapingService:
 
     @staticmethod
     async def _collect_stat_info(client: Any, chat: Any) -> dict[str, Any]:
-        """Iterate channel messages and compute stats matching ParsingResultPayload."""
+        """Пройтись по сообщениям канала и посчитать статистику для ParsingResultPayload."""
         images_count = 0
         videos_count = 0
         links_count = 0
@@ -227,7 +232,7 @@ class ScrapingService:
                 reactions_count += msg_reactions
                 daily_views[range_day]["reactions"] += msg_reactions
 
-        # --- Averages ---
+        # --- Средние ---
         avg_daily_views = (
             sum(d["total_views"] for d in daily_views.values()) // len(daily_views) if daily_views else 0
         )
@@ -238,12 +243,12 @@ class ScrapingService:
             sum(m["total_views"] for m in monthly_views.values()) // len(monthly_views) if monthly_views else 0
         )
 
-        # --- Medians ---
+        # --- Медианы ---
         median_daily = int(median(d["total_views"] for d in daily_views.values())) if daily_views else 0
         median_weekly = int(median(w["total_views"] for w in weekly_views.values())) if weekly_views else 0
         median_monthly = int(median(m["total_views"] for m in monthly_views.values())) if monthly_views else 0
 
-        # --- Average messages ---
+        # --- Среднее кол-во сообщений ---
         avg_messages_daily = messages_count // len(daily_views) if daily_views else 0
         avg_messages_weekly = messages_count // len(weekly_views) if weekly_views else 0
         avg_messages_monthly = messages_count // len(monthly_views) if monthly_views else 0

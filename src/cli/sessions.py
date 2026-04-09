@@ -1,28 +1,43 @@
 """
-CLI for session management.
+CLI для управления сессиями (Telethon).
 
-Usage:
+Использование:
   python -m src.cli.sessions import --file sessions.json
   python -m src.cli.sessions list
   python -m src.cli.sessions status
 """
 
 import asyncio
+import getpass
 import json
+import logging
 from pathlib import Path
 
 import typer
 
-app = typer.Typer(help="Telegram session management")
+_audit_logger = logging.getLogger("tg-service.audit.cli")
+_audit_logger.setLevel(logging.INFO)
+if not _audit_logger.handlers:
+    _h = logging.StreamHandler()
+    _h.setFormatter(logging.Formatter("%(asctime)s AUDIT %(message)s"))
+    _audit_logger.addHandler(_h)
+
+
+def _audit(action: str, details: str = "") -> None:
+    user = getpass.getuser()
+    _audit_logger.info("user=%s action=%s %s", user, action, details)
+
+
+app = typer.Typer(help="Управление Telegram-сессиями")
 
 
 @app.command("import")
 def import_sessions(
     file: Path = typer.Option(..., help="JSON file with sessions"),
 ) -> None:
-    """Import sessions from a JSON file.
+    """Импорт сессий из JSON-файла.
 
-    Expected format:
+    Ожидаемый формат:
     [
       {
         "phone": "+14244371383",
@@ -35,11 +50,13 @@ def import_sessions(
     ]
     """
     if not file.exists():
-        typer.echo(f"File not found: {file}")
+        typer.echo(f"Файл не найден: {file}")
         raise typer.Exit(1)
 
     with open(file) as f:
         sessions = json.load(f)
+
+    _audit("import_sessions", f"file={file} count={len(sessions)}")
 
     async def _import() -> None:
         from src.modules.accounts.service import AccountService
@@ -56,7 +73,8 @@ def import_sessions(
                 role=s.get("role", "scrape"),
             )
             count += 1
-        typer.echo(f"Imported {count} sessions")
+        _audit("import_sessions_done", f"imported={count}")
+        typer.echo(f"Импортировано {count} сессий")
 
     asyncio.run(_import())
 
@@ -65,12 +83,14 @@ def import_sessions(
 def list_sessions(
     role: str | None = typer.Option(None, help="Filter by role: scrape/manage"),
 ) -> None:
-    """List active sessions."""
+    """Список активных сессий."""
+    _audit("list_sessions", f"role={role}")
+
     async def _list() -> None:
         from src.modules.accounts.service import AccountService
         sessions = await AccountService.list_sessions(role=role)
         if not sessions:
-            typer.echo("No active sessions")
+            typer.echo("Нет активных сессий")
             return
         for s in sessions:
             status_icon = "✅" if s["fail_count"] == 0 else "⚠️"
@@ -81,7 +101,9 @@ def list_sessions(
 
 @app.command("status")
 def status() -> None:
-    """Show session pool status summary."""
+    """Показать summary статуса пула сессий."""
+    _audit("session_status")
+
     async def _status() -> None:
         from src.modules.accounts.service import AccountService
         sessions = await AccountService.list_sessions()

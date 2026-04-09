@@ -1,5 +1,8 @@
 """
-Posting service — send/edit/delete messages via aiogram bots.
+Сервис постинга — отправка/редактирование/удаление сообщений через aiogram-ботов.
+
+Ретраи с экспоненциальным backoff, rate limiting через Redis,
+батчевое обновление last_used_at для снижения нагрузки на БД.
 """
 
 import asyncio
@@ -35,9 +38,9 @@ class PostingService:
 
     @staticmethod
     def resolve_chat_id(raw: str) -> str | int:
-        """Convert platform URL or raw value to a chat_id aiogram understands.
+        """Преобразовать URL площадки или сырое значение в chat_id для aiogram.
 
-        Examples:
+        Примеры:
             "https://t.me/channel_name" → "@channel_name"
             "@channel_name"             → "@channel_name"
             "-1001234567890"            → -1001234567890
@@ -55,7 +58,7 @@ class PostingService:
 
     @staticmethod
     def _build_reply_markup(markup_data: list[dict] | None) -> InlineKeyboardMarkup | None:
-        """Build InlineKeyboardMarkup from backend payload."""
+        """Собрать InlineKeyboardMarkup из payload бекенда."""
         if not markup_data:
             return None
         buttons = []
@@ -75,7 +78,7 @@ class PostingService:
         markup: list[dict] | None = None,
         parse_mode: str | None = None,
     ) -> dict[str, Any]:
-        """Send a new message (text or photo) to a Telegram chat."""
+        """Отправить новое сообщение (текст или фото) в Telegram-чат."""
         posting_operations.labels(operation="send").inc()
         reply_markup = self._build_reply_markup(markup)
 
@@ -144,7 +147,7 @@ class PostingService:
         markup: list[dict] | None = None,
         parse_mode: str | None = None,
     ) -> dict[str, Any]:
-        """Edit an existing message."""
+        """Отредактировать существующее сообщение."""
         posting_operations.labels(operation="edit").inc()
         reply_markup = self._build_reply_markup(markup)
 
@@ -209,7 +212,7 @@ class PostingService:
         message_id: int,
         platform_id: str | None = None,
     ) -> dict[str, Any]:
-        """Delete a message."""
+        """Удалить сообщение."""
         posting_operations.labels(operation="delete").inc()
 
         if self._rate_limiter:
@@ -253,8 +256,8 @@ class PostingService:
             error_code=error_codes.ALL_BOTS_FAILED,
         )
 
-    # Batch _mark_used updates to reduce DB round-trips under load.
-    # Accumulated IDs are flushed every _MARK_FLUSH_INTERVAL or when batch is full.
+    # Батчевое обновление last_used_at чтобы не долбить БД на каждое сообщение.
+    # Накопленные ID сбрасываются когда батч заполнен или при shutdown.
     _mark_pending: set[str] = set()
     _mark_lock: asyncio.Lock = asyncio.Lock()
     _MARK_BATCH_SIZE: int = 20
@@ -269,7 +272,7 @@ class PostingService:
 
     @classmethod
     async def _flush_mark_used(cls) -> None:
-        """Flush all pending _mark_used updates in a single DB round-trip."""
+        """Сбросить все накопленные обновления last_used_at за один запрос в БД."""
         if not cls._mark_pending:
             return
         ids = list(cls._mark_pending)

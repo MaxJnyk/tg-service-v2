@@ -1,12 +1,12 @@
 """
-Kafka task consumer — subscribes to topics, deserializes, dispatches.
+Kafka consumer — подписывается на топики, десериализует, диспатчит обработчикам.
 
-Key design decisions:
-  - enable_auto_commit=False — manual commit AFTER processing guarantees at-least-once
-  - Concurrent processing: up to CONSUMER_CONCURRENCY tasks in parallel via Semaphore
-  - At-least-once delivery: manual commit + idempotency guard prevents loss & double-execution
-  - Scale horizontally: more replicas + Kafka partitions
-  - On handler error: classify → send error result → commit (don't block queue)
+Ключевые решения:
+  - enable_auto_commit=False — коммит вручную ПОСЛЕ обработки = at-least-once
+  - Конкурентность: до CONSUMER_CONCURRENCY задач параллельно через Semaphore
+  - Идемпотентность: ручной коммит + Redis-гард = нет потерь и дублей
+  - Горизонтальное масштабирование: больше реплик + Kafka-partitions
+  - При ошибке: шлём error result → коммитим (не блокируем очередь)
 """
 
 import asyncio
@@ -27,6 +27,7 @@ from src.core.metrics import (
     kafka_processing_duration,
 )
 from src.transport.producer import KafkaResultProducer
+from src.core.security import redact_sensitive
 from src.transport.router import TopicRouter
 from src.transport.schemas import TaskRequestSchema
 
@@ -36,11 +37,10 @@ _DRAIN_TIMEOUT = settings.SHUTDOWN_TIMEOUT if hasattr(settings, "SHUTDOWN_TIMEOU
 
 
 class _RebalanceListener:
-    """Handle Kafka consumer group rebalances safely.
+    """Обработка ребаланса Kafka consumer group.
 
-    On partition revoke: wait for in-flight tasks on those partitions to finish,
-    then commit their offsets before the partitions are handed to another consumer.
-    This prevents duplicate processing after rebalance.
+    При отзыве partitions: ждём завершения in-flight задач на этих partitions,
+    потом коммитим их оффсеты. Это предотвращает дубли после ребаланса.
     """
 
     def __init__(self, consumer: "KafkaTaskConsumer") -> None:
@@ -54,7 +54,7 @@ class _RebalanceListener:
             [f"{tp.topic}:{tp.partition}" for tp in revoked],
             len(self._consumer._tasks),
         )
-        # Wait for all in-flight tasks to complete (they may be on revoked partitions)
+        # Ждём завершения всех in-flight задач (могут быть на отозванных partitions)
         if self._consumer._tasks:
             done, pending = await asyncio.wait(
                 self._consumer._tasks,
@@ -100,12 +100,14 @@ class KafkaTaskConsumer:
             group_id=self._group_id,
             enable_auto_commit=False,
             auto_offset_reset="earliest",
-            # Prevent consumer eviction during long scraping (up to 30s per channel)
+            # Не даём Kafka выкинуть consumer во время долгого парсинга (до 30с на канал)
             session_timeout_ms=60_000,
             heartbeat_interval_ms=10_000,
             max_poll_interval_ms=300_000,
-            # Limit poll batch to avoid unbounded task creation
+            # Ограничиваем размер батча чтобы не плодить задачи без контроля
             max_poll_records=settings.CONSUMER_CONCURRENCY * 2,
+            # Ограничиваем fetch чтобы не жрать память на гигантских сообщениях
+            max_partition_fetch_bytes=1_048_576,  # 1 MB
         )
         self._consumer.subscribe(self._topics, listener=listener)
         await self._consumer.start()
@@ -136,11 +138,11 @@ class KafkaTaskConsumer:
         try:
             return orjson.loads(value)
         except Exception as exc:
-            logger.error("Malformed Kafka message (skip): %s | raw=%r", exc, value[:200])
+            logger.error("Malformed Kafka message (skip): %s | length=%d", exc, len(value))
             return None
 
     async def _commit_offset(self, msg: Any) -> None:
-        """Commit offset for a single processed message. Thread-safe via lock."""
+        """Коммит оффсета для одного обработанного сообщения. Потокобезопасно через lock."""
         if not self._consumer:
             return
         tp = TopicPartition(msg.topic, msg.partition)
@@ -151,15 +153,15 @@ class KafkaTaskConsumer:
                 logger.warning("Failed to commit offset %s:%d:%d: %s", msg.topic, msg.partition, msg.offset, exc)
 
     async def consume_loop(self) -> None:
-        """Concurrent consume loop with semaphore-based concurrency control.
+        """Конкурентный consume loop с контролем через Semaphore.
 
-        At-least-once + idempotency:
-          - auto_commit=False — offset committed only AFTER successful processing
-          - Idempotency guard in each handler prevents double-execution on redelivery
-          - On crash: Kafka redelivers uncommitted messages → idempotency guard skips duplicates
+        At-least-once + идемпотентность:
+          - auto_commit=False — оффсет коммитим только ПОСЛЕ обработки
+          - Идемпотентность в каждом handler'e защищает от повторной обработки
+          - При краше: Kafka передоставляет → идемпотентность скипает дубли
 
-        Throughput: up to CONSUMER_CONCURRENCY tasks in parallel.
-        Telegram rate limiter (shared Redis) prevents API abuse.
+        Пропускная способность: до CONSUMER_CONCURRENCY задач параллельно.
+        Rate limiter Telegram (через Redis) защищает от злоупотребления API.
         """
         if not self._consumer:
             raise RuntimeError("Consumer not started")
@@ -173,7 +175,7 @@ class KafkaTaskConsumer:
             task.add_done_callback(self._tasks.discard)
 
     async def _process_message(self, msg: Any) -> None:
-        """Process a single Kafka message under semaphore concurrency limit."""
+        """Обработка одного Kafka-сообщения под контролем semaphore."""
         async with self._semaphore:
             topic = msg.topic
             kafka_messages_received.labels(topic=topic).inc()
@@ -196,7 +198,8 @@ class KafkaTaskConsumer:
                 kafka_messages_processed.labels(topic=topic).inc()
 
             except Exception as exc:
-                logger.exception("Error processing message from %s: %s", topic, exc)
+                safe_error = redact_sensitive(str(exc))
+                logger.error("Error processing message from %s: %s", topic, safe_error)
                 kafka_messages_errors.labels(topic=topic, error_code="INTERNAL_ERROR").inc()
                 try:
                     request_id = data.get("request_id") if isinstance(data, dict) else None
@@ -205,15 +208,15 @@ class KafkaTaskConsumer:
                     fallback_request = TaskRequestSchema(
                         request_id=request_id,
                         callback_task_name=callback,
-                        payload=data if isinstance(data, dict) else None,
+                        payload=None,
                     )
                     await self._producer.send_result(
                         original_topic=topic,
                         request=fallback_request,
-                        error=f"INTERNAL_ERROR: {exc}",
+                        error=f"INTERNAL_ERROR: {safe_error}",
                     )
                 except Exception as send_exc:
-                    logger.exception("Failed to send error result: %s", send_exc)
+                    logger.error("Failed to send error result: %s", redact_sensitive(str(send_exc)))
 
             finally:
                 structlog.contextvars.unbind_contextvars("request_id", "topic")

@@ -1,10 +1,11 @@
 """
-Bot pool — lazy-loads aiogram Bot instances from encrypted tokens in DB.
+Пул ботов — лениво грузит aiogram Bot из зашифрованных токенов в БД.
 
-LRU eviction: when pool exceeds max_size, the least recently used bot
-(oldest access) is closed and removed.
+LRU-вытеснение: когда пул переполнен, самый давно неиспользуемый бот
+закрывается и удаляется из пула.
 """
 
+import gc
 import logging
 import time
 from collections import OrderedDict
@@ -23,7 +24,7 @@ from src.modules.accounts.models import BotAccount
 logger = logging.getLogger(__name__)
 
 
-_PLATFORM_CACHE_TTL = 60  # seconds
+_PLATFORM_CACHE_TTL = 60  # секунд кеша привязки бота к площадке
 
 
 class BotPool:
@@ -33,7 +34,7 @@ class BotPool:
         self._platform_cache: dict[str, tuple[BotAccount, float]] = {}  # platform_id -> (account, timestamp)
 
     async def get_bot(self, bot_account_id: str) -> Bot:
-        """Get or create a Bot instance by account ID."""
+        """Получить или создать Bot по ID аккаунта."""
         if bot_account_id in self._pool:
             self._pool.move_to_end(bot_account_id)
             return self._pool[bot_account_id]
@@ -53,8 +54,10 @@ class BotPool:
             connector = aiohttp.TCPConnector(resolver=aiohttp.ThreadedResolver())
             aio_session = AiohttpSession(connector=connector)
             bot = Bot(token=token, session=aio_session)
+            del token
+            gc.collect()
 
-            # Evict LRU bot if pool is full
+            # Вытесняем LRU-бота если пул полон
             while len(self._pool) >= self._max_size:
                 evicted_id, evicted_bot = self._pool.popitem(last=False)
                 try:
@@ -68,9 +71,9 @@ class BotPool:
             return bot
 
     async def get_bot_for_platform(self, platform_id: str) -> tuple[Bot, BotAccount]:
-        """Get an active bot linked to a platform, or any active bot as fallback.
+        """Получить активного бота для площадки, или любого активного как fallback.
 
-        Uses an in-memory TTL cache to avoid repeated DB lookups.
+        TTL-кеш в памяти чтобы не долбить БД на каждый запрос.
         """
         now = time.monotonic()
         cached = self._platform_cache.get(platform_id)
@@ -82,7 +85,7 @@ class BotPool:
             del self._platform_cache[platform_id]
 
         async with async_session_factory() as db_session:
-            # Try platform-specific bot first
+            # Сначала ищем бота привязанного к площадке
             result = await db_session.execute(
                 select(BotAccount).where(
                     BotAccount.platform_id == platform_id,
@@ -92,7 +95,7 @@ class BotPool:
             account = result.scalar_one_or_none()
 
             if not account:
-                # Fallback: any active bot
+                # Fallback: любой активный бот
                 result = await db_session.execute(
                     select(BotAccount).where(
                         BotAccount.is_active.is_(True),
@@ -108,8 +111,8 @@ class BotPool:
             return bot, account
 
     async def mark_bot_failed(self, bot_account_id: str) -> None:
-        """Increment fail count; deactivate if too many failures."""
-        # Invalidate platform cache entries pointing to this bot
+        """Увеличить счётчик ошибок; деактивировать если слишком много фейлов (>=5)."""
+        # Инвалидируем кеш площадок где был этот бот
         to_evict = [pid for pid, (acc, _) in self._platform_cache.items() if acc.id == bot_account_id]
         for pid in to_evict:
             del self._platform_cache[pid]
@@ -129,7 +132,7 @@ class BotPool:
                 await db_session.commit()
 
     async def close_all(self) -> None:
-        """Close all bot sessions."""
+        """Закрыть все сессии ботов (при shutdown)."""
         for bot_id, bot in self._pool.items():
             try:
                 await bot.session.close()

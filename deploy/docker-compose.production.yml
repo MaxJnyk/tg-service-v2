@@ -20,6 +20,21 @@ services:
       timeout: 10s
       retries: 3
       start_period: 15s
+    labels:
+      # Traefik - основной роутер для метрик
+      - "traefik.enable=true"
+      - "traefik.docker.network=tad-network"
+      - "traefik.http.routers.tg-service-metrics.rule=Host(`${TRAEFIK_DOMAIN_METRICS:-tg-metrics.lgd.cx}`)"
+      - "traefik.http.routers.tg-service-metrics.entrypoints=websecure"
+      - "traefik.http.routers.tg-service-metrics.tls.certresolver=myresolver"
+      - "traefik.http.services.tg-service-metrics.loadbalancer.server.port=9090"
+      # Basic Auth middleware для защиты метрик
+      - "traefik.http.routers.tg-service-metrics.middlewares=basic-auth@file"
+      # Healthcheck endpoint отдельно (без auth для внутренних проверок)
+      - "traefik.http.routers.tg-service-health.rule=Host(`${TRAEFIK_DOMAIN_METRICS:-tg-metrics.lgd.cx}`) && Path(`/ready`)"
+      - "traefik.http.routers.tg-service-health.entrypoints=websecure"
+      - "traefik.http.routers.tg-service-health.tls.certresolver=myresolver"
+      - "traefik.http.services.tg-service-health.loadbalancer.server.port=9090"
     logging:
       driver: json-file
       options:

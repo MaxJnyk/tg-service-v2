@@ -1,8 +1,8 @@
 """
-Kafka handler for scraping topic:
+Kafka-обработчик для парсинга:
   - scrape_platform
 
-Parses PlatformSchema from payload, calls ScrapingService, sends result.
+Парсит PlatformSchema из payload, вызывает ScrapingService, отправляет результат.
 """
 
 import logging
@@ -15,18 +15,18 @@ from src.transport.schemas import TaskRequestSchema
 
 logger = logging.getLogger(__name__)
 
-_IDEMPOTENCY_TTL = 86400  # 24h
+_IDEMPOTENCY_TTL = 86400  # 24 часа TTL идемпотентности
 
 
 async def _check_idempotency(request_id: str) -> bool:
-    """Return True if already processed (duplicate)."""
+    """True если уже обработан (дубль)."""
     key = f"tg_idem:scrape:{request_id}"
     result = await get_redis().set(key, "1", nx=True, ex=_IDEMPOTENCY_TTL)
     return result is None  # None → key existed → duplicate
 
 
 def create_scraping_handlers(scraping_service: ScrapingService) -> dict:
-    """Create scraping handler functions."""
+    """Создать handler-функции для парсинга."""
 
     async def handle_scrape_platform(
         request: TaskRequestSchema,
@@ -38,12 +38,12 @@ def create_scraping_handlers(scraping_service: ScrapingService) -> dict:
 
         payload = request.payload or {}
 
-        # Extract platform info — compatible with ScrapperTaskSchema
+        # Извлекаем platform — совместимо с ScrapperTaskSchema
         platform = payload.get("platform", payload)
         url = platform.get("url", "")
         platform_id = str(platform.get("id", ""))
 
-        # Extract username from URL
+        # Вытаскиваем username из URL
         username = url.strip("/").split("/")[-1] if url else ""
         if not username:
             await producer.send_result(

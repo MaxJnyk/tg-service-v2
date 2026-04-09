@@ -35,9 +35,13 @@ ENV PATH="/venv/bin:$PATH" \
 
 WORKDIR /app
 
+RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser
+
 COPY --link --from=builder /venv /venv
 COPY --link --from=builder /app /app
 
-RUN chmod +x /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh && chown -R appuser:appuser /app
+
+USER appuser
 
 CMD ["/app/entrypoint.sh"]

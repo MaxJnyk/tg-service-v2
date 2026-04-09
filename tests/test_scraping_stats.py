@@ -1,5 +1,5 @@
 """
-Tests for ScrapingService._collect_stat_info — edge cases: empty messages, median on empty, men_percent.
+Тесты для ScrapingService._collect_stat_info — edge cases: пустые сообщения, медиана на пустоте, men_percent.
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -13,15 +13,15 @@ from src.modules.scraping.session_pool import SessionPool
 class TestCollectStatInfo:
     @pytest.mark.asyncio
     async def test_empty_messages_returns_zeroes(self):
-        """When iter_messages yields nothing, all stats should be zero."""
+        """Когда iter_messages ничего не возвращает, все статистики должны быть нулем."""
         pool = MagicMock(spec=SessionPool)
         service = ScrapingService(pool)
 
         client = MagicMock()
-        # iter_messages returns empty async iterator
+        # iter_messages возвращает пустой async iterator
         async def empty_iter(*args, **kwargs):
             return
-            yield  # noqa: unreachable — makes it an async generator
+            yield  # noqa: unreachable — делает его async generator
 
         client.iter_messages = empty_iter
 
@@ -39,7 +39,7 @@ class TestCollectStatInfo:
 
     @pytest.mark.asyncio
     async def test_men_percent_is_none(self):
-        """men_percent should be None (no data) not 0."""
+        """men_percent должен быть None (нет данных), не 0."""
         pool = MagicMock(spec=SessionPool)
         service = ScrapingService(pool)
 
